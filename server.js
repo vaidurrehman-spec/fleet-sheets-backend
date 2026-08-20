@@ -32,10 +32,20 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
 // ----------------------------------------------------
 async function appendToGoogleSheet(tripData) {
   try {
-    const auth = new google.auth.GoogleAuth({
-      keyFile: 'credentials.json',
-      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-    });
+    let auth;
+    if (process.env.GOOGLE_CREDENTIALS_JSON) {
+      // Production on Render using Environment Variable
+      auth = new google.auth.GoogleAuth({
+        credentials: JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON),
+        scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+      });
+    } else {
+      // Local development using credentials.json file
+      auth = new google.auth.GoogleAuth({
+        keyFile: 'credentials.json',
+        scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+      });
+    }
 
     const client = await auth.getClient();
     const googleSheets = google.sheets({ version: 'v4', auth: client });
@@ -91,7 +101,7 @@ async function appendToGoogleSheet(tripData) {
 // 2. API ENDPOINTS
 // ----------------------------------------------------
 
-// Endpoint for Mobile App to sync enterprise trips to Google Sheets
+// Endpoint for Mobile App / Web to sync enterprise trips to Google Sheets
 app.post('/api/trips/sync', async (req, res) => {
   try {
     const { vehicle_id, driver_name, trips } = req.body;
@@ -103,12 +113,12 @@ app.post('/api/trips/sync', async (req, res) => {
     for (const trip of trips) {
       await appendToGoogleSheet({
         vehicle_id,
-        driver_name,
-        customer_name: trip.customer_name,
+        driver_name: driver_name || 'Web User',
+        customer_name: trip.customer_name || 'General Route',
         start_odometer: trip.start_odometer,
         end_odometer: trip.end_odometer,
-        start_gps: trip.start_gps,
-        end_gps: trip.end_gps,
+        start_gps: trip.start_gps || '',
+        end_gps: trip.end_gps || '',
         timestamp: trip.timestamp
       });
     }
