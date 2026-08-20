@@ -34,7 +34,6 @@ async function appendToGoogleSheet(tripData) {
   try {
     let auth;
     if (process.env.GOOGLE_CREDENTIALS_JSON) {
-      // Production on Render using Environment Variable with safe trimming
       const rawCreds = process.env.GOOGLE_CREDENTIALS_JSON.trim();
       const credentials = JSON.parse(rawCreds);
 
@@ -43,7 +42,6 @@ async function appendToGoogleSheet(tripData) {
         scopes: ['https://www.googleapis.com/auth/spreadsheets'],
       });
     } else {
-      // Local development using credentials.json file
       auth = new google.auth.GoogleAuth({
         keyFile: 'credentials.json',
         scopes: ['https://www.googleapis.com/auth/spreadsheets'],
@@ -113,7 +111,7 @@ async function appendToGoogleSheet(tripData) {
 
     await googleSheets.spreadsheets.values.append({
       spreadsheetId,
-      range: `${sheetName}!A:J`, // Dynamically appends to the current month's tab
+      range: `${sheetName}!A:J`,
       valueInputOption: 'USER_ENTERED',
       resource: {
         values: [rowData],
@@ -155,6 +153,70 @@ app.post('/api/trips/sync', async (req, res) => {
   } catch (error) {
     console.error('Error syncing trips:', error);
     res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// Endpoint to get detailed summary for a specific month (e.g. GET /api/fleet/summary/August%202026)
+app.get('/api/fleet/summary/:monthYear', async (req, res) => {
+  try {
+    const sheetName = req.params.monthYear;
+    
+    let auth;
+    if (process.env.GOOGLE_CREDENTIALS_JSON) {
+      const rawCreds = process.env.GOOGLE_CREDENTIALS_JSON.trim();
+      const credentials = JSON.parse(rawCreds);
+      auth = new google.auth.GoogleAuth({
+        credentials,
+        scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
+      });
+    } else {
+      auth = new google.auth.GoogleAuth({
+        keyFile: 'credentials.json',
+        scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
+      });
+    }
+
+    const client = await auth.getClient();
+    const googleSheets = google.sheets({ version: 'v4', auth: client });
+    const spreadsheetId = process.env.SPREADSHEET_ID;
+
+    const response = await googleSheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: `${sheetName}!A:J`,
+    });
+
+    const rows = response.data.values;
+    if (!rows || rows.length < 2) {
+      return res.status(200).json({ month: sheetName, message: 'No data found for this month', breakdown: {} });
+    }
+
+    // Distinguish by combining Driver Name, Vehicle ID, and Customer Name
+    const detailedSummary = {};
+
+    for (let i = 1; i < rows.length; i++) {
+      const row = rows[i];
+      const vehicleId = row[1] || 'Unknown Vehicle';
+      const driverName = row[2] || 'Unknown Driver';
+      const customerName = row[3] || 'General Route';
+      const manualDist = parseFloat(row[6]) || 0;
+
+      // Unique key format: "DriverName | VehicleID | CustomerName"
+      const key = `${driverName} | ${vehicleId} | ${customerName}`;
+
+      if (!detailedSummary[key]) {
+        detailedSummary[key] = 0;
+      }
+      detailedSummary[key] += manualDist;
+    }
+
+    return res.status(200).json({
+      month: sheetName,
+      breakdown: detailedSummary
+    });
+
+  } catch (error) {
+    console.error('Error fetching summary:', error);
+    res.status(500).json({ error: 'Failed to calculate summary data' });
   }
 });
 
