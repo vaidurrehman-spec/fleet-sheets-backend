@@ -28,7 +28,7 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
 }
 
 // ----------------------------------------------------
-// 1. GOOGLE SHEETS FUNCTION (Enterprise Dual-Tracking)
+// 1. GOOGLE SHEETS FUNCTION (Dynamic Monthly Tabs)
 // ----------------------------------------------------
 async function appendToGoogleSheet(tripData) {
   try {
@@ -55,6 +55,32 @@ async function appendToGoogleSheet(tripData) {
 
     const spreadsheetId = process.env.SPREADSHEET_ID;
 
+    // Determine the sheet name dynamically based on current month/year (e.g., "August 2026")
+    const date = new Date();
+    const sheetName = date.toLocaleString('default', { month: 'long', year: 'numeric' });
+
+    // Check if the monthly sheet exists, create it if it doesn't
+    const spreadsheet = await googleSheets.spreadsheets.get({ spreadsheetId });
+    const sheetExists = spreadsheet.data.sheets.some(s => s.properties.title === sheetName);
+
+    if (!sheetExists) {
+      await googleSheets.spreadsheets.batchUpdate({
+        spreadsheetId,
+        resource: {
+          requests: [{ addSheet: { properties: { title: sheetName } } }]
+        }
+      });
+      // Add headers to the new monthly sheet
+      await googleSheets.spreadsheets.values.update({
+        spreadsheetId,
+        range: `${sheetName}!A1:J1`,
+        valueInputOption: 'USER_ENTERED',
+        resource: {
+          values: [['Timestamp', 'Vehicle ID', 'Driver Name', 'Customer Name', 'Start Odo', 'End Odo', 'Manual Dist', 'Start GPS', 'End GPS', 'GPS Dist (km)']]
+        }
+      });
+    }
+
     // Calculate manual odometer distance
     let manualDistance = '';
     if (tripData.start_odometer && tripData.end_odometer) {
@@ -72,7 +98,6 @@ async function appendToGoogleSheet(tripData) {
       }
     }
 
-    // Columns: Date/Time, Vehicle No, Driver Name, Customer, Start Odo, End Odo, Manual Dist, Start GPS, End GPS, GPS Dist (km)
     const rowData = [
       tripData.timestamp || new Date().toLocaleString(),
       tripData.vehicle_id || '',
@@ -88,13 +113,13 @@ async function appendToGoogleSheet(tripData) {
 
     await googleSheets.spreadsheets.values.append({
       spreadsheetId,
-      range: 'Sheet1!A:J', // Extended range from A through J for enterprise tracking
+      range: `${sheetName}!A:J`, // Dynamically appends to the current month's tab
       valueInputOption: 'USER_ENTERED',
       resource: {
         values: [rowData],
       },
     });
-    console.log(`[Google Sheets] Logged enterprise trip for Driver: ${tripData.driver_name} | Vehicle: ${tripData.vehicle_id}`);
+    console.log(`[Google Sheets] Logged trip to sheet [${sheetName}] for Driver: ${tripData.driver_name} | Vehicle: ${tripData.vehicle_id}`);
   } catch (error) {
     console.error('Error writing to Google Sheet:', error);
   }
@@ -126,7 +151,7 @@ app.post('/api/trips/sync', async (req, res) => {
       });
     }
 
-    res.status(200).json({ status: 'success', message: 'Enterprise trip data synced to Google Sheets!' });
+    res.status(200).json({ status: 'success', message: 'Enterprise trip data synced to monthly sheets!' });
   } catch (error) {
     console.error('Error syncing trips:', error);
     res.status(500).json({ error: 'Internal Server Error' });
