@@ -34,9 +34,12 @@ async function appendToGoogleSheet(tripData) {
   try {
     let auth;
     if (process.env.GOOGLE_CREDENTIALS_JSON) {
-      // Production on Render using Environment Variable
+      // Production on Render using Environment Variable with safe trimming
+      const rawCreds = process.env.GOOGLE_CREDENTIALS_JSON.trim();
+      const credentials = JSON.parse(rawCreds);
+
       auth = new google.auth.GoogleAuth({
-        credentials: JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON),
+        credentials,
         scopes: ['https://www.googleapis.com/auth/spreadsheets'],
       });
     } else {
