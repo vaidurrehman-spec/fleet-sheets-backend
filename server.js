@@ -14,6 +14,9 @@ const PORT = process.env.PORT || 3000;
 // In-memory storage for real-time Master tracking of active cars
 const liveFleetTracker = {};
 
+// In-memory store for driver registration and admin approval
+let driversDB = [];
+
 // Helper function to calculate distance in kilometers using the Haversine formula
 function calculateDistance(lat1, lon1, lat2, lon2) {
   const R = 6371; // Earth radius in km
@@ -127,7 +130,121 @@ async function appendToGoogleSheet(tripData) {
 // 2. API ENDPOINTS
 // ----------------------------------------------------
 
-// Endpoint for Mobile App / Web to sync enterprise trips to Google Sheets
+// --- Driver Registration & Approval Endpoints ---
+app.post('/api/drivers/register', (req, res) => {
+  const { driver_name, vehicle_id } = req.body;
+  if (!driver_name || !vehicle_id) {
+    return res.status(400).json({ status: 'error', message: 'Driver name and vehicle ID are required.' });
+  }
+
+  let existingDriver = driversDB.find(d => d.driver_name.toLowerCase() === driver_name.toLowerCase());
+  if (existingDriver) {
+    return res.status(200).json({ 
+      status: existingDriver.status, 
+      message: `Current approval status: ${existingDriver.status}` 
+    });
+  }
+
+  driversDB.push({
+    driver_name,
+    vehicle_id,
+    status: 'pending' // Default status until admin approves
+  });
+
+  return res.status(200).json({ 
+    status: 'pending', 
+    message: 'Registration submitted successfully. Waiting for admin approval.' 
+  });
+});
+
+app.get('/api/admin/drivers', (req, res) => {
+  return res.status(200).json({ 
+    status: 'success', 
+    drivers: driversDB 
+  });
+});
+
+app.post('/api/admin/drivers/update-status', (req, res) => {
+  const { driver_name, status } = req.body; // status should be 'approved' or 'rejected'
+
+  if (!driver_name || !status) {
+    return res.status(400).json({ status: 'error', message: 'Driver name and status are required.' });
+  }
+
+  let driver = driversDB.find(d => d.driver_name.toLowerCase() === driver_name.toLowerCase());
+  if (driver) {
+    driver.status = status;
+    return res.status(200).json({ status: 'success', message: `Driver status updated to ${status}` });
+  }
+
+  return res.status(404).json({ status: 'error', message: 'Driver not found.' });
+});
+
+// --- Endpoint for Mobile App to View Own Monthly History ---
+app.get('/api/drivers/history/:monthYear/:driverName', async (req, res) => {
+  try {
+    const { monthYear, driverName } = req.params;
+    
+    let auth;
+    if (process.env.GOOGLE_CREDENTIALS_JSON) {
+      const rawCreds = process.env.GOOGLE_CREDENTIALS_JSON.trim();
+      const credentials = JSON.parse(rawCreds);
+      auth = new google.auth.GoogleAuth({
+        credentials,
+        scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
+      });
+    } else {
+      auth = new google.auth.GoogleAuth({
+        keyFile: 'credentials.json',
+        scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
+      });
+    }
+
+    const client = await auth.getClient();
+    const googleSheets = google.sheets({ version: 'v4', auth: client });
+    const spreadsheetId = process.env.SPREADSHEET_ID;
+
+    const response = await googleSheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: `${monthYear}!A:J`,
+    });
+
+    const rows = response.data.values;
+    if (!rows || rows.length < 2) {
+      return res.status(200).json({ driver: driverName, month: monthYear, trips: [] });
+    }
+
+    const driverTrips = [];
+    for (let i = 1; i < rows.length; i++) {
+      const row = rows[i];
+      const rowDriver = row[2] || '';
+      
+      if (rowDriver.toLowerCase() === driverName.toLowerCase()) {
+        driverTrips.push({
+          timestamp: row[0],
+          vehicle_id: row[1],
+          customer_name: row[3],
+          start_odometer: row[4],
+          end_odometer: row[5],
+          manual_dist: row[6],
+          gps_dist: row[9]
+        });
+      }
+    }
+
+    return res.status(200).json({
+      driver: driverName,
+      month: monthYear,
+      trips: driverTrips
+    });
+
+  } catch (error) {
+    console.error('Error fetching driver monthly history:', error);
+    res.status(500).json({ error: 'Failed to fetch driver history' });
+  }
+});
+
+// --- Endpoint for Mobile App / Web to sync enterprise trips to Google Sheets ---
 app.post('/api/trips/sync', async (req, res) => {
   try {
     const { vehicle_id, driver_name, trips } = req.body;
@@ -156,7 +273,7 @@ app.post('/api/trips/sync', async (req, res) => {
   }
 });
 
-// Endpoint to get detailed summary for a specific month (e.g. GET /api/fleet/summary/August%202026)
+// Endpoint to get detailed summary for a specific month
 app.get('/api/fleet/summary/:monthYear', async (req, res) => {
   try {
     const sheetName = req.params.monthYear;
@@ -190,7 +307,6 @@ app.get('/api/fleet/summary/:monthYear', async (req, res) => {
       return res.status(200).json({ month: sheetName, message: 'No data found for this month', breakdown: {} });
     }
 
-    // Distinguish by combining Driver Name, Vehicle ID, and Customer Name
     const detailedSummary = {};
 
     for (let i = 1; i < rows.length; i++) {
@@ -200,7 +316,6 @@ app.get('/api/fleet/summary/:monthYear', async (req, res) => {
       const customerName = row[3] || 'General Route';
       const manualDist = parseFloat(row[6]) || 0;
 
-      // Unique key format: "DriverName | VehicleID | CustomerName"
       const key = `${driverName} | ${vehicleId} | ${customerName}`;
 
       if (!detailedSummary[key]) {
@@ -220,7 +335,7 @@ app.get('/api/fleet/summary/:monthYear', async (req, res) => {
   }
 });
 
-// Endpoint for Mobile App to send live GPS coordinates (Master system)
+// Endpoint for Mobile App to send live GPS coordinates
 app.post('/api/fleet/location', async (req, res) => {
   try {
     const { vehicle_id, latitude, longitude, speed, timestamp } = req.body;
@@ -245,7 +360,7 @@ app.post('/api/fleet/location', async (req, res) => {
   }
 });
 
-// Endpoint for your Master dashboard to view all active vehicles running
+// Endpoint for Master dashboard to view all active vehicles
 app.get('/api/fleet/live-status', (req, res) => {
   return res.status(200).json({
     total_active_vehicles: Object.keys(liveFleetTracker).length,
