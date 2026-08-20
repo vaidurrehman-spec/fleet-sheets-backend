@@ -180,6 +180,87 @@ app.post('/api/admin/drivers/update-status', (req, res) => {
   return res.status(404).json({ status: 'error', message: 'Driver not found.' });
 });
 
+// --- Admin Endpoints for Live Inspection & One-Click Billing ---
+
+// Single driver live telemetry inspection for Admin
+app.get('/api/admin/driver-details/:driverName', (req, res) => {
+  const driverName = req.params.driverName.toLowerCase();
+  
+  let matchedVehicleId = null;
+  const driverEntry = driversDB.find(d => d.driver_name.toLowerCase() === driverName);
+  if (driverEntry) {
+    matchedVehicleId = driverEntry.vehicle_id;
+  }
+
+  let locationInfo = { latitude: 'N/A', longitude: 'N/A', heading: 'Stationary', timestamp: 'No transmission' };
+  if (matchedVehicleId && liveFleetTracker[matchedVehicleId]) {
+    const loc = liveFleetTracker[matchedVehicleId];
+    locationInfo = {
+      latitude: loc.latitude,
+      longitude: loc.longitude,
+      heading: 'Active on road',
+      timestamp: loc.last_updated
+    };
+  }
+
+  res.status(200).json({
+    driver_name: req.params.driverName,
+    ...locationInfo
+  });
+});
+
+// One-Click Billing & Client Summary from Google Sheets
+app.get('/api/admin/billing-summary/:monthYear', async (req, res) => {
+  try {
+    const sheetName = req.params.monthYear;
+    let auth;
+    if (process.env.GOOGLE_CREDENTIALS_JSON) {
+      const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON.trim());
+      auth = new google.auth.GoogleAuth({ credentials, scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'] });
+    } else {
+      auth = new google.auth.GoogleAuth({ keyFile: 'credentials.json', scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'] });
+    }
+
+    const client = await auth.getClient();
+    const googleSheets = google.sheets({ version: 'v4', auth: client });
+    const spreadsheetId = process.env.SPREADSHEET_ID;
+
+    const response = await googleSheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: `${sheetName}!A:J`,
+    });
+
+    const rows = response.data.values;
+    if (!rows || rows.length < 2) {
+      return res.status(200).json({ month: sheetName, client_totals: [] });
+    }
+
+    const clientMap = {};
+    for (let i = 1; i < rows.length; i++) {
+      const row = rows[i];
+      const customerName = row[3] || 'General Client';
+      const manualDist = parseFloat(row[6]) || 0;
+
+      if (!clientMap[customerName]) {
+        clientMap[customerName] = { total_trips: 0, total_km: 0 };
+      }
+      clientMap[customerName].total_trips += 1;
+      clientMap[customerName].total_km += manualDist;
+    }
+
+    const clientTotals = Object.keys(clientMap).map(clientName => ({
+      client_name: clientName,
+      total_trips: clientMap[clientName].total_trips,
+      total_km: parseFloat(clientMap[clientName].total_km.toFixed(2))
+    }));
+
+    return res.status(200).json({ month: sheetName, client_totals: clientTotals });
+  } catch (error) {
+    console.error('Error generating billing summary:', error);
+    return res.status(500).json({ error: 'Failed to calculate billing data' });
+  }
+});
+
 // --- Endpoint for Mobile App to View Own Monthly History ---
 app.get('/api/drivers/history/:monthYear/:driverName', async (req, res) => {
   try {
@@ -368,9 +449,6 @@ app.get('/api/fleet/live-status', (req, res) => {
   });
 });
 
-// ----------------------------------------------------
-// 3. START SERVER
-// ----------------------------------------------------
 // ----------------------------------------------------
 // 3. START SERVER
 // ----------------------------------------------------
