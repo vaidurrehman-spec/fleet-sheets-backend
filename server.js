@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const { google } = require('googleapis');
+const ExcelJS = require('exceljs'); // Added ExcelJS for file generation
 require('dotenv').config();
 
 const app = express();
@@ -258,6 +259,76 @@ app.get('/api/admin/billing-summary/:monthYear', async (req, res) => {
   } catch (error) {
     console.error('Error generating billing summary:', error);
     return res.status(500).json({ error: 'Failed to calculate billing data' });
+  }
+});
+
+// --- NEW EXCEL EXPORT ENDPOINT ---
+app.get('/api/admin/export-excel/:monthYear', async (req, res) => {
+  try {
+    const sheetName = req.params.monthYear;
+    let auth;
+    if (process.env.GOOGLE_CREDENTIALS_JSON) {
+      const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON.trim());
+      auth = new google.auth.GoogleAuth({ credentials, scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'] });
+    } else {
+      auth = new google.auth.GoogleAuth({ keyFile: 'credentials.json', scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'] });
+    }
+
+    const client = await auth.getClient();
+    const googleSheets = google.sheets({ version: 'v4', auth: client });
+    const spreadsheetId = process.env.SPREADSHEET_ID;
+
+    const response = await googleSheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: `${sheetName}!A:J`,
+    });
+
+    const rows = response.data.values;
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet('Monthly Fleet Logs');
+
+    sheet.columns = [
+      { header: 'Timestamp', key: 'timestamp', width: 20 },
+      { header: 'Vehicle ID', key: 'vehicle_id', width: 15 },
+      { header: 'Driver Name', key: 'driver_name', width: 20 },
+      { header: 'Customer Name', key: 'customer_name', width: 25 },
+      { header: 'Start Odo', key: 'start_odometer', width: 15 },
+      { header: 'End Odo', key: 'end_odometer', width: 15 },
+      { header: 'Manual Dist (km)', key: 'manual_dist', width: 18 },
+      { header: 'Start GPS', key: 'start_gps', width: 22 },
+      { header: 'End GPS', key: 'end_gps', width: 22 },
+      { header: 'GPS Dist (km)', key: 'gps_dist', width: 15 },
+    ];
+
+    sheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFF' } };
+    sheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: '4F46E5' } };
+
+    if (rows && rows.length > 1) {
+      for (let i = 1; i < rows.length; i++) {
+        const r = rows[i];
+        sheet.addRow({
+          timestamp: r[0] || '',
+          vehicle_id: r[1] || '',
+          driver_name: r[2] || '',
+          customer_name: r[3] || '',
+          start_odometer: r[4] || '',
+          end_odometer: r[5] || '',
+          manual_dist: r[6] || '',
+          start_gps: r[7] || '',
+          end_gps: r[8] || '',
+          gps_dist: r[9] || '',
+        });
+      }
+    }
+
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename=Fleet_Report_${sheetName.replace(' ', '_')}.xlsx`);
+
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (error) {
+    console.error('Error exporting excel:', error);
+    res.status(500).send('Error generating Excel file: ' + error.message);
   }
 });
 

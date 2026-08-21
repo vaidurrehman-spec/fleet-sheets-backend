@@ -3,12 +3,15 @@
   "version": "1.0.0",
   "bin": "server.js",
   "pkg": {
-    "targets": ["node18-win-x64"],
+    "targets": [
+      "node18-win-x64"
+    ],
     "outputPath": "dist"
   },
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
+    "exceljs": "^4.4.0",
     "express": "^4.19.2",
     "googleapis": "^134.0.0"
   }
