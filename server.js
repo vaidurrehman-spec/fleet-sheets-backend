@@ -2,7 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const { google } = require('googleapis');
-const ExcelJS = require('exceljs'); // Added ExcelJS for file generation
+const ExcelJS = require('exceljs');
 require('dotenv').config();
 
 const app = express();
@@ -12,15 +12,11 @@ app.use(cors());
 
 const PORT = process.env.PORT || 3000;
 
-// In-memory storage for real-time Master tracking of active cars
 const liveFleetTracker = {};
-
-// In-memory store for driver registration and admin approval
 let driversDB = [];
 
-// Helper function to calculate distance in kilometers using the Haversine formula
 function calculateDistance(lat1, lon1, lat2, lon2) {
-  const R = 6371; // Earth radius in km
+  const R = 6371;
   const dLat = (lat2 - lat1) * (Math.PI / 180);
   const dLon = (lon2 - lon1) * (Math.PI / 180);
   const a =
@@ -28,83 +24,64 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
     Math.cos(lat1 * (Math.PI / 180)) * Math.cos(lat2 * (Math.PI / 180)) *
     Math.sin(dLon / 2) * Math.sin(dLon / 2);
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return R * c; // Distance in km
+  return R * c;
 }
 
-// ----------------------------------------------------
-// 1. GOOGLE SHEETS FUNCTION (Dynamic Monthly Tabs)
-// ----------------------------------------------------
 async function appendToGoogleSheet(tripData) {
   try {
     let auth;
     if (process.env.GOOGLE_CREDENTIALS_JSON) {
-      const rawCreds = process.env.GOOGLE_CREDENTIALS_JSON.trim();
-      const credentials = JSON.parse(rawCreds);
-
-      auth = new google.auth.GoogleAuth({
-        credentials,
-        scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-      });
+      const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON.trim());
+      auth = new google.auth.GoogleAuth({ credentials, scopes: ['https://www.googleapis.com/auth/spreadsheets'] });
     } else {
-      auth = new google.auth.GoogleAuth({
-        keyFile: 'credentials.json',
-        scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-      });
+      auth = new google.auth.GoogleAuth({ keyFile: 'credentials.json', scopes: ['https://www.googleapis.com/auth/spreadsheets'] });
     }
 
     const client = await auth.getClient();
     const googleSheets = google.sheets({ version: 'v4', auth: client });
-
     const spreadsheetId = process.env.SPREADSHEET_ID;
 
-    // Determine the sheet name dynamically based on current month/year (e.g., "August 2026")
     const date = new Date();
     const sheetName = date.toLocaleString('default', { month: 'long', year: 'numeric' });
 
-    // Check if the monthly sheet exists, create it if it doesn't
     const spreadsheet = await googleSheets.spreadsheets.get({ spreadsheetId });
     const sheetExists = spreadsheet.data.sheets.some(s => s.properties.title === sheetName);
 
     if (!sheetExists) {
       await googleSheets.spreadsheets.batchUpdate({
         spreadsheetId,
-        resource: {
-          requests: [{ addSheet: { properties: { title: sheetName } } }]
-        }
+        resource: { requests: [{ addSheet: { properties: { title: sheetName } } }] }
       });
-      // Add headers to the new monthly sheet
       await googleSheets.spreadsheets.values.update({
         spreadsheetId,
         range: `${sheetName}!A1:J1`,
         valueInputOption: 'USER_ENTERED',
-        resource: {
-          values: [['Timestamp', 'Vehicle ID', 'Driver Name', 'Customer Name', 'Start Odo', 'End Odo', 'Manual Dist', 'Start GPS', 'End GPS', 'GPS Dist (km)']]
-        }
+        resource: { values: [['Timestamp', 'Vehicle ID', 'Driver Name', 'Customer Name', 'Start Odo', 'End Odo', 'Manual Dist', 'Start GPS', 'End GPS', 'GPS Dist (km)']] }
       });
     }
 
-    // Calculate manual odometer distance
     let manualDistance = '';
     if (tripData.start_odometer && tripData.end_odometer) {
       manualDistance = parseFloat(tripData.end_odometer) - parseFloat(tripData.start_odometer);
     }
 
-    // Calculate GPS distance if start and end coordinates are provided
     let gpsDistanceKm = '';
     if (tripData.start_gps && tripData.end_gps) {
       const [startLat, startLon] = tripData.start_gps.split(',').map(Number);
       const [endLat, endLon] = tripData.end_gps.split(',').map(Number);
-      
       if (!isNaN(startLat) && !isNaN(startLon) && !isNaN(endLat) && !isNaN(endLon)) {
         gpsDistanceKm = calculateDistance(startLat, startLon, endLat, endLon).toFixed(2);
       }
     }
 
+    // Resolves and guarantees driver name is written into Column C
+    const finalDriverName = (tripData.driver_name || tripData.root_driver_name || '').trim().toUpperCase();
+
     const rowData = [
       tripData.timestamp || new Date().toLocaleString(),
-      tripData.vehicle_id || '',
-      tripData.driver_name || '',
-      tripData.customer_name || '',
+      tripData.vehicle_id ? tripData.vehicle_id.trim().toUpperCase() : '',
+      finalDriverName,
+      tripData.customer_name ? tripData.customer_name.trim().toUpperCase() : '',
       tripData.start_odometer || '',
       tripData.end_odometer || '',
       manualDistance,
@@ -117,100 +94,63 @@ async function appendToGoogleSheet(tripData) {
       spreadsheetId,
       range: `${sheetName}!A:J`,
       valueInputOption: 'USER_ENTERED',
-      resource: {
-        values: [rowData],
-      },
+      resource: { values: [rowData] },
     });
-    console.log(`[Google Sheets] Logged trip to sheet [${sheetName}] for Driver: ${tripData.driver_name} | Vehicle: ${tripData.vehicle_id}`);
   } catch (error) {
     console.error('Error writing to Google Sheet:', error);
   }
 }
 
-// ----------------------------------------------------
-// 2. API ENDPOINTS
-// ----------------------------------------------------
-
-// --- Driver Registration & Approval Endpoints ---
 app.post('/api/drivers/register', (req, res) => {
   const { driver_name, vehicle_id } = req.body;
   if (!driver_name || !vehicle_id) {
     return res.status(400).json({ status: 'error', message: 'Driver name and vehicle ID are required.' });
   }
 
-  let existingDriver = driversDB.find(d => d.driver_name.toLowerCase() === driver_name.toLowerCase());
-  if (existingDriver) {
-    return res.status(200).json({ 
-      status: existingDriver.status, 
-      message: `Current approval status: ${existingDriver.status}` 
-    });
+  const normalizedDriverName = driver_name.trim().toUpperCase();
+  if (normalizedDriverName === 'INPUT TEXT') {
+    return res.status(400).json({ status: 'error', message: 'Invalid placeholder name.' });
   }
 
-  driversDB.push({
-    driver_name,
-    vehicle_id,
-    status: 'pending' // Default status until admin approves
-  });
+  let existingDriver = driversDB.find(d => d.driver_name.trim().toUpperCase() === normalizedDriverName);
+  
+  if (existingDriver) {
+    return res.status(200).json({ status: existingDriver.status, message: `Current approval status: ${existingDriver.status}` });
+  }
 
-  return res.status(200).json({ 
-    status: 'pending', 
-    message: 'Registration submitted successfully. Waiting for admin approval.' 
-  });
+  driversDB.push({ driver_name: normalizedDriverName, vehicle_id: vehicle_id.trim().toUpperCase(), status: 'pending' });
+  return res.status(200).json({ status: 'pending', message: 'Registration submitted successfully.' });
 });
 
 app.get('/api/admin/drivers', (req, res) => {
-  return res.status(200).json({ 
-    status: 'success', 
-    drivers: driversDB 
-  });
+  return res.status(200).json({ status: 'success', drivers: driversDB });
 });
 
 app.post('/api/admin/drivers/update-status', (req, res) => {
-  const { driver_name, status } = req.body; // status should be 'approved' or 'rejected'
-
-  if (!driver_name || !status) {
-    return res.status(400).json({ status: 'error', message: 'Driver name and status are required.' });
-  }
-
-  let driver = driversDB.find(d => d.driver_name.toLowerCase() === driver_name.toLowerCase());
+  const { driver_name, status } = req.body;
+  const normalizedDriverName = driver_name.trim().toUpperCase();
+  let driver = driversDB.find(d => d.driver_name.trim().toUpperCase() === normalizedDriverName);
   if (driver) {
     driver.status = status;
     return res.status(200).json({ status: 'success', message: `Driver status updated to ${status}` });
   }
-
   return res.status(404).json({ status: 'error', message: 'Driver not found.' });
 });
 
-// --- Admin Endpoints for Live Inspection & One-Click Billing ---
-
-// Single driver live telemetry inspection for Admin
 app.get('/api/admin/driver-details/:driverName', (req, res) => {
-  const driverName = req.params.driverName.toLowerCase();
-  
+  const driverName = req.params.driverName.trim().toUpperCase();
   let matchedVehicleId = null;
-  const driverEntry = driversDB.find(d => d.driver_name.toLowerCase() === driverName);
-  if (driverEntry) {
-    matchedVehicleId = driverEntry.vehicle_id;
-  }
+  const driverEntry = driversDB.find(d => d.driver_name.trim().toUpperCase() === driverName);
+  if (driverEntry) matchedVehicleId = driverEntry.vehicle_id;
 
   let locationInfo = { latitude: 'N/A', longitude: 'N/A', heading: 'Stationary', timestamp: 'No transmission' };
   if (matchedVehicleId && liveFleetTracker[matchedVehicleId]) {
     const loc = liveFleetTracker[matchedVehicleId];
-    locationInfo = {
-      latitude: loc.latitude,
-      longitude: loc.longitude,
-      heading: 'Active on road',
-      timestamp: loc.last_updated
-    };
+    locationInfo = { latitude: loc.latitude, longitude: loc.longitude, heading: 'Active on road', timestamp: loc.last_updated };
   }
-
-  res.status(200).json({
-    driver_name: req.params.driverName,
-    ...locationInfo
-  });
+  res.status(200).json({ driver_name: req.params.driverName, ...locationInfo });
 });
 
-// One-Click Billing & Client Summary from Google Sheets
 app.get('/api/admin/billing-summary/:monthYear', async (req, res) => {
   try {
     const sheetName = req.params.monthYear;
@@ -233,20 +173,25 @@ app.get('/api/admin/billing-summary/:monthYear', async (req, res) => {
 
     const rows = response.data.values;
     if (!rows || rows.length < 2) {
-      return res.status(200).json({ month: sheetName, client_totals: [] });
+      return res.status(200).json({ month: sheetName, client_totals: [], driver_totals: [] });
     }
 
     const clientMap = {};
+    const driverMap = {};
+
     for (let i = 1; i < rows.length; i++) {
       const row = rows[i];
-      const customerName = row[3] || 'General Client';
+      const customerName = (row[3] || 'GENERAL CLIENT').trim().toUpperCase();
+      const driverName = (row[2] || 'UNKNOWN DRIVER').trim().toUpperCase();
       const manualDist = parseFloat(row[6]) || 0;
 
-      if (!clientMap[customerName]) {
-        clientMap[customerName] = { total_trips: 0, total_km: 0 };
-      }
+      if (!clientMap[customerName]) clientMap[customerName] = { total_trips: 0, total_km: 0 };
       clientMap[customerName].total_trips += 1;
       clientMap[customerName].total_km += manualDist;
+
+      if (!driverMap[driverName]) driverMap[driverName] = { total_trips: 0, total_km: 0 };
+      driverMap[driverName].total_trips += 1;
+      driverMap[driverName].total_km += manualDist;
     }
 
     const clientTotals = Object.keys(clientMap).map(clientName => ({
@@ -255,14 +200,28 @@ app.get('/api/admin/billing-summary/:monthYear', async (req, res) => {
       total_km: parseFloat(clientMap[clientName].total_km.toFixed(2))
     }));
 
-    return res.status(200).json({ month: sheetName, client_totals: clientTotals });
+    const driverTotals = Object.keys(driverMap).map(driverName => ({
+      driver_name: driverName,
+      total_trips: driverMap[driverName].total_trips,
+      total_km: parseFloat(driverMap[driverName].total_km.toFixed(2))
+    }));
+
+    return res.status(200).json({ 
+      month: sheetName, 
+      client_totals: clientTotals, 
+      driver_totals: driverTotals 
+    });
   } catch (error) {
-    console.error('Error generating billing summary:', error);
-    return res.status(500).json({ error: 'Failed to calculate billing data' });
+    console.error('Error generating summary:', error);
+    return res.status(500).json({ error: 'Failed to calculate summary data' });
   }
 });
 
-// --- NEW EXCEL EXPORT ENDPOINT ---
+app.get('/api/admin/driver-summary/:monthYear', async (req, res) => {
+  req.url = `/api/admin/billing-summary/${req.params.monthYear}`;
+  return app._router.handle(req, res);
+});
+
 app.get('/api/admin/export-excel/:monthYear', async (req, res) => {
   try {
     const sheetName = req.params.monthYear;
@@ -278,16 +237,12 @@ app.get('/api/admin/export-excel/:monthYear', async (req, res) => {
     const googleSheets = google.sheets({ version: 'v4', auth: client });
     const spreadsheetId = process.env.SPREADSHEET_ID;
 
-    const response = await googleSheets.spreadsheets.values.get({
-      spreadsheetId,
-      range: `${sheetName}!A:J`,
-    });
-
+    const response = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: `${sheetName}!A:J` });
     const rows = response.data.values;
     const workbook = new ExcelJS.Workbook();
-    const sheet = workbook.addWorksheet('Monthly Fleet Logs');
+    const logSheet = workbook.addWorksheet('Monthly Fleet Logs');
 
-    sheet.columns = [
+    logSheet.columns = [
       { header: 'Timestamp', key: 'timestamp', width: 20 },
       { header: 'Vehicle ID', key: 'vehicle_id', width: 15 },
       { header: 'Driver Name', key: 'driver_name', width: 20 },
@@ -300,116 +255,68 @@ app.get('/api/admin/export-excel/:monthYear', async (req, res) => {
       { header: 'GPS Dist (km)', key: 'gps_dist', width: 15 },
     ];
 
-    sheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFF' } };
-    sheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: '4F46E5' } };
-
     if (rows && rows.length > 1) {
       for (let i = 1; i < rows.length; i++) {
         const r = rows[i];
-        sheet.addRow({
-          timestamp: r[0] || '',
-          vehicle_id: r[1] || '',
-          driver_name: r[2] || '',
-          customer_name: r[3] || '',
-          start_odometer: r[4] || '',
-          end_odometer: r[5] || '',
-          manual_dist: r[6] || '',
-          start_gps: r[7] || '',
-          end_gps: r[8] || '',
-          gps_dist: r[9] || '',
+        logSheet.addRow({
+          timestamp: r[0] || '', vehicle_id: r[1] || '', driver_name: r[2] || '', customer_name: r[3] || '',
+          start_odometer: r[4] || '', end_odometer: r[5] || '', manual_dist: r[6] || '',
+          start_gps: r[7] || '', end_gps: r[8] || '', gps_dist: r[9] || '',
         });
       }
     }
 
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename=Fleet_Report_${sheetName.replace(' ', '_')}.xlsx`);
-
     await workbook.xlsx.write(res);
     res.end();
   } catch (error) {
-    console.error('Error exporting excel:', error);
     res.status(500).send('Error generating Excel file: ' + error.message);
   }
 });
 
-// --- Endpoint for Mobile App to View Own Monthly History ---
 app.get('/api/drivers/history/:monthYear/:driverName', async (req, res) => {
   try {
-    const { monthYear, driverName } = req.params;
-    
+    const { monthYear } = req.params;
+    const driverName = req.params.driverName.trim().toUpperCase();
     let auth;
     if (process.env.GOOGLE_CREDENTIALS_JSON) {
-      const rawCreds = process.env.GOOGLE_CREDENTIALS_JSON.trim();
-      const credentials = JSON.parse(rawCreds);
-      auth = new google.auth.GoogleAuth({
-        credentials,
-        scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
-      });
+      const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON.trim());
+      auth = new google.auth.GoogleAuth({ credentials, scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'] });
     } else {
-      auth = new google.auth.GoogleAuth({
-        keyFile: 'credentials.json',
-        scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
-      });
+      auth = new google.auth.GoogleAuth({ keyFile: 'credentials.json', scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'] });
     }
 
     const client = await auth.getClient();
     const googleSheets = google.sheets({ version: 'v4', auth: client });
     const spreadsheetId = process.env.SPREADSHEET_ID;
 
-    const response = await googleSheets.spreadsheets.values.get({
-      spreadsheetId,
-      range: `${monthYear}!A:J`,
-    });
-
+    const response = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: `${monthYear}!A:J` });
     const rows = response.data.values;
-    if (!rows || rows.length < 2) {
-      return res.status(200).json({ driver: driverName, month: monthYear, trips: [] });
-    }
+    if (!rows || rows.length < 2) return res.status(200).json({ driver: driverName, month: monthYear, trips: [] });
 
     const driverTrips = [];
     for (let i = 1; i < rows.length; i++) {
       const row = rows[i];
-      const rowDriver = row[2] || '';
-      
-      if (rowDriver.toLowerCase() === driverName.toLowerCase()) {
-        driverTrips.push({
-          timestamp: row[0],
-          vehicle_id: row[1],
-          customer_name: row[3],
-          start_odometer: row[4],
-          end_odometer: row[5],
-          manual_dist: row[6],
-          gps_dist: row[9]
-        });
+      if ((row[2] || '').trim().toUpperCase() === driverName) {
+        driverTrips.push({ timestamp: row[0], vehicle_id: row[1], customer_name: row[3], start_odometer: row[4], end_odometer: row[5], manual_dist: row[6], gps_dist: row[9] });
       }
     }
-
-    return res.status(200).json({
-      driver: driverName,
-      month: monthYear,
-      trips: driverTrips
-    });
-
+    return res.status(200).json({ driver: driverName, month: monthYear, trips: driverTrips });
   } catch (error) {
-    console.error('Error fetching driver monthly history:', error);
     res.status(500).json({ error: 'Failed to fetch driver history' });
   }
 });
 
-// --- Endpoint for Mobile App / Web to sync enterprise trips to Google Sheets ---
 app.post('/api/trips/sync', async (req, res) => {
   try {
     const { vehicle_id, driver_name, trips } = req.body;
-
-    if (!trips || trips.length === 0) {
-      return res.status(400).json({ error: 'No trips provided' });
-    }
-
     for (const trip of trips) {
       await appendToGoogleSheet({
         vehicle_id,
-        driver_name: driver_name || 'Web User',
-        customer_name: trip.customer_name || 'General Route',
+        root_driver_name: driver_name,
+        driver_name: trip.driver_name || driver_name || 'WEB USER',
+        customer_name: trip.customer_name || 'GENERAL ROUTE',
         start_odometer: trip.start_odometer,
         end_odometer: trip.end_odometer,
         start_gps: trip.start_gps || '',
@@ -417,112 +324,22 @@ app.post('/api/trips/sync', async (req, res) => {
         timestamp: trip.timestamp
       });
     }
-
-    res.status(200).json({ status: 'success', message: 'Enterprise trip data synced to monthly sheets!' });
+    res.status(200).json({ status: 'success', message: 'Synced successfully!' });
   } catch (error) {
-    console.error('Error syncing trips:', error);
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
 
-// Endpoint to get detailed summary for a specific month
-app.get('/api/fleet/summary/:monthYear', async (req, res) => {
-  try {
-    const sheetName = req.params.monthYear;
-    
-    let auth;
-    if (process.env.GOOGLE_CREDENTIALS_JSON) {
-      const rawCreds = process.env.GOOGLE_CREDENTIALS_JSON.trim();
-      const credentials = JSON.parse(rawCreds);
-      auth = new google.auth.GoogleAuth({
-        credentials,
-        scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
-      });
-    } else {
-      auth = new google.auth.GoogleAuth({
-        keyFile: 'credentials.json',
-        scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
-      });
-    }
-
-    const client = await auth.getClient();
-    const googleSheets = google.sheets({ version: 'v4', auth: client });
-    const spreadsheetId = process.env.SPREADSHEET_ID;
-
-    const response = await googleSheets.spreadsheets.values.get({
-      spreadsheetId,
-      range: `${sheetName}!A:J`,
-    });
-
-    const rows = response.data.values;
-    if (!rows || rows.length < 2) {
-      return res.status(200).json({ month: sheetName, message: 'No data found for this month', breakdown: {} });
-    }
-
-    const detailedSummary = {};
-
-    for (let i = 1; i < rows.length; i++) {
-      const row = rows[i];
-      const vehicleId = row[1] || 'Unknown Vehicle';
-      const driverName = row[2] || 'Unknown Driver';
-      const customerName = row[3] || 'General Route';
-      const manualDist = parseFloat(row[6]) || 0;
-
-      const key = `${driverName} | ${vehicleId} | ${customerName}`;
-
-      if (!detailedSummary[key]) {
-        detailedSummary[key] = 0;
-      }
-      detailedSummary[key] += manualDist;
-    }
-
-    return res.status(200).json({
-      month: sheetName,
-      breakdown: detailedSummary
-    });
-
-  } catch (error) {
-    console.error('Error fetching summary:', error);
-    res.status(500).json({ error: 'Failed to calculate summary data' });
-  }
+app.post('/api/fleet/location', (req, res) => {
+  const { vehicle_id, latitude, longitude, speed, timestamp } = req.body;
+  liveFleetTracker[vehicle_id] = { latitude, longitude, speed: speed || 0, last_updated: timestamp || new Date().toISOString() };
+  res.status(200).json({ status: 'success' });
 });
 
-// Endpoint for Mobile App to send live GPS coordinates
-app.post('/api/fleet/location', async (req, res) => {
-  try {
-    const { vehicle_id, latitude, longitude, speed, timestamp } = req.body;
-
-    if (!vehicle_id || !latitude || !longitude) {
-      return res.status(400).json({ error: 'Missing required location data' });
-    }
-
-    liveFleetTracker[vehicle_id] = {
-      latitude,
-      longitude,
-      speed: speed || 0,
-      last_updated: timestamp || new Date().toISOString()
-    };
-
-    console.log(`[Master System] Location updated -> Vehicle: ${vehicle_id} | Lat: ${latitude} | Lng: ${longitude}`);
-
-    return res.status(200).json({ status: 'success', message: 'Location recorded by master system' });
-  } catch (error) {
-    console.error('Master tracking error:', error);
-    return res.status(500).json({ error: 'Server error processing location' });
-  }
-});
-
-// Endpoint for Master dashboard to view all active vehicles
 app.get('/api/fleet/live-status', (req, res) => {
-  return res.status(200).json({
-    total_active_vehicles: Object.keys(liveFleetTracker).length,
-    fleet_data: liveFleetTracker
-  });
+  res.status(200).json({ total_active_vehicles: Object.keys(liveFleetTracker).length, fleet_data: liveFleetTracker });
 });
 
-// ----------------------------------------------------
-// 3. START SERVER
-// ----------------------------------------------------
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`--- FLEET MASTER SERVER RUNNING ON PORT ${PORT} ---`);
+  console.log(`--- SERVER RUNNING ON PORT ${PORT} ---`);
 });
