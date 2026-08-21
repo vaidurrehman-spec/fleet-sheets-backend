@@ -54,9 +54,9 @@ async function appendToGoogleSheet(tripData) {
       });
       await googleSheets.spreadsheets.values.update({
         spreadsheetId,
-        range: `${sheetName}!A1:J1`,
+        range: `${sheetName}!A1:K1`,
         valueInputOption: 'USER_ENTERED',
-        resource: { values: [['Timestamp', 'Vehicle ID', 'Driver Name', 'Customer Name', 'Start Odo', 'End Odo', 'Manual Dist', 'Start GPS', 'End GPS', 'GPS Dist (km)']] }
+        resource: { values: [['Start Time', 'End Time', 'Vehicle ID', 'Driver Name', 'Customer Name', 'Start Odo', 'End Odo', 'Manual Dist', 'Start GPS', 'End GPS', 'GPS Dist (km)']] }
       });
     }
 
@@ -74,10 +74,10 @@ async function appendToGoogleSheet(tripData) {
       }
     }
 
-    // Resolves and guarantees driver name is written into Column C
     const finalDriverName = (tripData.driver_name || tripData.root_driver_name || '').trim().toUpperCase();
 
     const rowData = [
+      tripData.start_timestamp || '',
       tripData.timestamp || new Date().toLocaleString(),
       tripData.vehicle_id ? tripData.vehicle_id.trim().toUpperCase() : '',
       finalDriverName,
@@ -92,7 +92,7 @@ async function appendToGoogleSheet(tripData) {
 
     await googleSheets.spreadsheets.values.append({
       spreadsheetId,
-      range: `${sheetName}!A:J`,
+      range: `${sheetName}!A:K`,
       valueInputOption: 'USER_ENTERED',
       resource: { values: [rowData] },
     });
@@ -102,23 +102,36 @@ async function appendToGoogleSheet(tripData) {
 }
 
 app.post('/api/drivers/register', (req, res) => {
-  const { driver_name, vehicle_id } = req.body;
-  if (!driver_name || !vehicle_id) {
-    return res.status(400).json({ status: 'error', message: 'Driver name and vehicle ID are required.' });
+  const { driver_name, phone_number, vehicle_id } = req.body;
+  if (!driver_name || !phone_number || !vehicle_id) {
+    return res.status(400).json({ status: 'error', message: 'Driver name, phone number, and vehicle ID are required.' });
   }
 
   const normalizedDriverName = driver_name.trim().toUpperCase();
+  const normalizedPhone = phone_number.trim();
+  const normalizedVehicleId = vehicle_id.trim().toUpperCase();
+
   if (normalizedDriverName === 'INPUT TEXT') {
     return res.status(400).json({ status: 'error', message: 'Invalid placeholder name.' });
   }
 
-  let existingDriver = driversDB.find(d => d.driver_name.trim().toUpperCase() === normalizedDriverName);
+  let existingDriver = driversDB.find(d => d.phone_number === normalizedPhone);
   
   if (existingDriver) {
+    existingDriver.driver_name = normalizedDriverName;
+    if (existingDriver.vehicle_id !== normalizedVehicleId) {
+      existingDriver.vehicle_id = normalizedVehicleId;
+      existingDriver.status = 'pending';
+    }
     return res.status(200).json({ status: existingDriver.status, message: `Current approval status: ${existingDriver.status}` });
   }
 
-  driversDB.push({ driver_name: normalizedDriverName, vehicle_id: vehicle_id.trim().toUpperCase(), status: 'pending' });
+  driversDB.push({ 
+    driver_name: normalizedDriverName, 
+    phone_number: normalizedPhone, 
+    vehicle_id: normalizedVehicleId, 
+    status: 'pending' 
+  });
   return res.status(200).json({ status: 'pending', message: 'Registration submitted successfully.' });
 });
 
@@ -127,9 +140,14 @@ app.get('/api/admin/drivers', (req, res) => {
 });
 
 app.post('/api/admin/drivers/update-status', (req, res) => {
-  const { driver_name, status } = req.body;
+  const { driver_name, phone_number, status } = req.body;
   const normalizedDriverName = driver_name.trim().toUpperCase();
-  let driver = driversDB.find(d => d.driver_name.trim().toUpperCase() === normalizedDriverName);
+  
+  let driver = driversDB.find(d => 
+    d.driver_name.trim().toUpperCase() === normalizedDriverName && 
+    (!phone_number || d.phone_number === phone_number.trim())
+  );
+
   if (driver) {
     driver.status = status;
     return res.status(200).json({ status: 'success', message: `Driver status updated to ${status}` });
@@ -139,16 +157,31 @@ app.post('/api/admin/drivers/update-status', (req, res) => {
 
 app.get('/api/admin/driver-details/:driverName', (req, res) => {
   const driverName = req.params.driverName.trim().toUpperCase();
-  let matchedVehicleId = null;
-  const driverEntry = driversDB.find(d => d.driver_name.trim().toUpperCase() === driverName);
-  if (driverEntry) matchedVehicleId = driverEntry.vehicle_id;
+  const phoneParam = (req.query.phone || '').trim();
 
-  let locationInfo = { latitude: 'N/A', longitude: 'N/A', heading: 'Stationary', timestamp: 'No transmission' };
+  let driverEntry = driversDB.find(d => 
+    d.driver_name.trim().toUpperCase() === driverName && 
+    (!phoneParam || d.phone_number === phoneParam)
+  );
+
+  if (!driverEntry) {
+    driverEntry = driversDB.find(d => d.driver_name.trim().toUpperCase() === driverName);
+  }
+
+  let matchedVehicleId = driverEntry ? driverEntry.vehicle_id : null;
+
+  let locationInfo = { latitude: 'N/A', longitude: 'N/A', speed: 0, heading: 'Stationary', timestamp: 'No transmission' };
   if (matchedVehicleId && liveFleetTracker[matchedVehicleId]) {
     const loc = liveFleetTracker[matchedVehicleId];
-    locationInfo = { latitude: loc.latitude, longitude: loc.longitude, heading: 'Active on road', timestamp: loc.last_updated };
+    locationInfo = { latitude: loc.latitude, longitude: loc.longitude, speed: loc.speed, heading: 'Active on road', timestamp: loc.last_updated };
   }
-  res.status(200).json({ driver_name: req.params.driverName, ...locationInfo });
+  
+  res.status(200).json({ 
+    driver_name: driverName, 
+    phone_number: driverEntry ? driverEntry.phone_number : 'N/A',
+    vehicle_id: matchedVehicleId || 'N/A',
+    ...locationInfo 
+  });
 });
 
 app.get('/api/admin/billing-summary/:monthYear', async (req, res) => {
@@ -168,7 +201,7 @@ app.get('/api/admin/billing-summary/:monthYear', async (req, res) => {
 
     const response = await googleSheets.spreadsheets.values.get({
       spreadsheetId,
-      range: `${sheetName}!A:J`,
+      range: `${sheetName}!A:K`,
     });
 
     const rows = response.data.values;
@@ -181,9 +214,9 @@ app.get('/api/admin/billing-summary/:monthYear', async (req, res) => {
 
     for (let i = 1; i < rows.length; i++) {
       const row = rows[i];
-      const customerName = (row[3] || 'GENERAL CLIENT').trim().toUpperCase();
-      const driverName = (row[2] || 'UNKNOWN DRIVER').trim().toUpperCase();
-      const manualDist = parseFloat(row[6]) || 0;
+      const customerName = (row[4] || 'GENERAL CLIENT').trim().toUpperCase();
+      const driverName = (row[3] || 'UNKNOWN DRIVER').trim().toUpperCase();
+      const manualDist = parseFloat(row[7]) || 0;
 
       if (!clientMap[customerName]) clientMap[customerName] = { total_trips: 0, total_km: 0 };
       clientMap[customerName].total_trips += 1;
@@ -237,13 +270,14 @@ app.get('/api/admin/export-excel/:monthYear', async (req, res) => {
     const googleSheets = google.sheets({ version: 'v4', auth: client });
     const spreadsheetId = process.env.SPREADSHEET_ID;
 
-    const response = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: `${sheetName}!A:J` });
+    const response = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: `${sheetName}!A:K` });
     const rows = response.data.values;
     const workbook = new ExcelJS.Workbook();
     const logSheet = workbook.addWorksheet('Monthly Fleet Logs');
 
     logSheet.columns = [
-      { header: 'Timestamp', key: 'timestamp', width: 20 },
+      { header: 'Start Time', key: 'start_timestamp', width: 20 },
+      { header: 'End Time', key: 'timestamp', width: 20 },
       { header: 'Vehicle ID', key: 'vehicle_id', width: 15 },
       { header: 'Driver Name', key: 'driver_name', width: 20 },
       { header: 'Customer Name', key: 'customer_name', width: 25 },
@@ -259,9 +293,9 @@ app.get('/api/admin/export-excel/:monthYear', async (req, res) => {
       for (let i = 1; i < rows.length; i++) {
         const r = rows[i];
         logSheet.addRow({
-          timestamp: r[0] || '', vehicle_id: r[1] || '', driver_name: r[2] || '', customer_name: r[3] || '',
-          start_odometer: r[4] || '', end_odometer: r[5] || '', manual_dist: r[6] || '',
-          start_gps: r[7] || '', end_gps: r[8] || '', gps_dist: r[9] || '',
+          start_timestamp: r[0] || '', timestamp: r[1] || '', vehicle_id: r[2] || '', driver_name: r[3] || '', customer_name: r[4] || '',
+          start_odometer: r[5] || '', end_odometer: r[6] || '', manual_dist: r[7] || '',
+          start_gps: r[8] || '', end_gps: r[9] || '', gps_dist: r[10] || '',
         });
       }
     }
@@ -291,15 +325,15 @@ app.get('/api/drivers/history/:monthYear/:driverName', async (req, res) => {
     const googleSheets = google.sheets({ version: 'v4', auth: client });
     const spreadsheetId = process.env.SPREADSHEET_ID;
 
-    const response = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: `${monthYear}!A:J` });
+    const response = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: `${monthYear}!A:K` });
     const rows = response.data.values;
     if (!rows || rows.length < 2) return res.status(200).json({ driver: driverName, month: monthYear, trips: [] });
 
     const driverTrips = [];
     for (let i = 1; i < rows.length; i++) {
       const row = rows[i];
-      if ((row[2] || '').trim().toUpperCase() === driverName) {
-        driverTrips.push({ timestamp: row[0], vehicle_id: row[1], customer_name: row[3], start_odometer: row[4], end_odometer: row[5], manual_dist: row[6], gps_dist: row[9] });
+      if ((row[3] || '').trim().toUpperCase() === driverName) {
+        driverTrips.push({ start_timestamp: row[0], timestamp: row[1], vehicle_id: row[2], customer_name: row[4], start_odometer: row[5], end_odometer: row[6], manual_dist: row[7], gps_dist: row[10] });
       }
     }
     return res.status(200).json({ driver: driverName, month: monthYear, trips: driverTrips });
@@ -321,6 +355,7 @@ app.post('/api/trips/sync', async (req, res) => {
         end_odometer: trip.end_odometer,
         start_gps: trip.start_gps || '',
         end_gps: trip.end_gps || '',
+        start_timestamp: trip.start_timestamp || '',
         timestamp: trip.timestamp
       });
     }
@@ -332,7 +367,10 @@ app.post('/api/trips/sync', async (req, res) => {
 
 app.post('/api/fleet/location', (req, res) => {
   const { vehicle_id, latitude, longitude, speed, timestamp } = req.body;
-  liveFleetTracker[vehicle_id] = { latitude, longitude, speed: speed || 0, last_updated: timestamp || new Date().toISOString() };
+  if (vehicle_id) {
+    const normalizedVid = vehicle_id.trim().toUpperCase();
+    liveFleetTracker[normalizedVid] = { latitude, longitude, speed: speed || 0, last_updated: timestamp || new Date().toISOString() };
+  }
   res.status(200).json({ status: 'success' });
 });
 
