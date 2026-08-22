@@ -110,6 +110,24 @@ async function ensureAdminUsersSheetExists(googleSheets, spreadsheetId) {
   }
 }
 
+async function ensureFuelSheetExists(googleSheets, spreadsheetId) {
+  const spreadsheet = await googleSheets.spreadsheets.get({ spreadsheetId });
+  const sheetExists = spreadsheet.data.sheets.some(s => s.properties.title === 'FuelLogs');
+
+  if (!sheetExists) {
+    await googleSheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      resource: { requests: [{ addSheet: { properties: { title: 'FuelLogs' } } }] }
+    });
+    await googleSheets.spreadsheets.values.update({
+      spreadsheetId,
+      range: 'FuelLogs!A1:G1',
+      valueInputOption: 'USER_ENTERED',
+      resource: { values: [['Timestamp', 'Vehicle ID', 'Driver Name', 'Fuel Type', 'Quantity / Liters', 'Total Cost (₹)', 'Odometer']] }
+    });
+  }
+}
+
 function calculateDistance(lat1, lon1, lat2, lon2) {
   const R = 6371;
   const dLat = (lat2 - lat1) * (Math.PI / 180);
@@ -744,6 +762,44 @@ app.post('/api/trips/sync', async (req, res) => {
     res.status(200).json({ status: 'success' });
   } catch (error) {
     res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// --- FUEL / GAS FILLING LOGGING ENDPOINT ---
+app.post('/api/fuel/sync', async (req, res) => {
+  try {
+    const { vehicle_id, driver_name, fuel_type, liters, total_cost, odometer, timestamp } = req.body;
+    
+    if (!vehicle_id || !liters || !total_cost) {
+      return res.status(400).json({ status: 'error', message: 'Missing required fuel fields.' });
+    }
+
+    const googleSheets = await getGoogleSheetsClient();
+    const spreadsheetId = process.env.SPREADSHEET_ID;
+    
+    await ensureFuelSheetExists(googleSheets, spreadsheetId);
+
+    const rowData = [
+      timestamp || new Date().toLocaleString(),
+      vehicle_id.trim().toUpperCase(),
+      (driver_name || '').trim().toUpperCase(),
+      fuel_type || 'CNG', // CNG, Petrol, or Diesel
+      liters,
+      total_cost,
+      odometer || ''
+    ];
+
+    await googleSheets.spreadsheets.values.append({
+      spreadsheetId,
+      range: 'FuelLogs!A:G',
+      valueInputOption: 'USER_ENTERED',
+      resource: { values: [rowData] },
+    });
+
+    return res.status(200).json({ status: 'success', message: 'Fuel record logged successfully!' });
+  } catch (error) {
+    console.error('Error syncing fuel log:', error);
+    return res.status(500).json({ status: 'error', message: 'Internal Server Error while syncing fuel log' });
   }
 });
 
