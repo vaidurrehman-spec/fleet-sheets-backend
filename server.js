@@ -445,6 +445,58 @@ app.post('/api/drivers/reset-password', async (req, res) => {
   }
 });
 
+// --- DRIVER HISTORY ENDPOINT ---
+app.get('/api/drivers/history/:monthYear/:driverName', async (req, res) => {
+  try {
+    const { monthYear, driverName } = req.params;
+    const targetDriver = driverName.trim().toUpperCase();
+    
+    const googleSheets = await getGoogleSheetsClient();
+    const spreadsheetId = process.env.SPREADSHEET_ID;
+
+    const spreadsheet = await googleSheets.spreadsheets.get({ spreadsheetId });
+    const sheetExists = spreadsheet.data.sheets.some(s => s.properties.title === monthYear);
+
+    if (!sheetExists) {
+      return res.status(200).json({ trips: [] });
+    }
+
+    const response = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: `${monthYear}!A:K` });
+    const rows = response.data.values || [];
+    
+    if (rows.length < 2) {
+      return res.status(200).json({ trips: [] });
+    }
+
+    const driverTrips = [];
+    for (let i = 1; i < rows.length; i++) {
+      const r = rows[i];
+      const rowDriver = (r[3] || '').trim().toUpperCase();
+
+      if (rowDriver === targetDriver) {
+        driverTrips.push({
+          start_timestamp: r[0] || '',
+          timestamp: r[1] || '',
+          vehicle_id: r[2] || '',
+          driver_name: r[3] || '',
+          customer_name: r[4] || '',
+          start_odometer: r[5] || '',
+          end_odometer: r[6] || '',
+          manual_dist: r[7] || '',
+          start_gps: r[8] || '',
+          end_gps: r[9] || '',
+          gps_dist: r[10] || '',
+        });
+      }
+    }
+
+    return res.status(200).json({ trips: driverTrips });
+  } catch (error) {
+    console.error('Error fetching driver history:', error);
+    return res.status(500).json({ error: 'Failed to fetch driver history' });
+  }
+});
+
 // --- PROTECTED ADMIN ENDPOINTS (REQUIRES verifyAdminAuth) ---
 app.get('/api/admin/drivers', verifyAdminAuth, async (req, res) => {
   try {
