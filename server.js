@@ -14,15 +14,45 @@ app.use(cors());
 const PORT = process.env.PORT || 3000;
 const liveFleetTracker = {};
 
-// --- SECURITY MIDDLEWARE (THE BOUNCER) ---
-function verifyAdminAuth(req, res, next) {
-  const adminSecret = process.env.ADMIN_SECRET_KEY || 'FALLBACK_SECRET_PASSWORD';
-  const authHeader = req.headers['authorization'];
-  
-  if (!authHeader || authHeader !== `Bearer ${adminSecret}`) {
-    return res.status(401).json({ status: 'error', message: 'Unauthorized: Access denied.' });
+// --- SECURE DYNAMIC ADMIN AUTH MIDDLEWARE ---
+async function verifyAdminAuth(req, res, next) {
+  try {
+    const authHeader = req.headers['authorization'];
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ status: 'error', message: 'Unauthorized: No token provided.' });
+    }
+
+    const tokenPassword = authHeader.split(' ')[1];
+    const adminSecret = process.env.ADMIN_SECRET_KEY || 'FALLBACK_SECRET_PASSWORD';
+
+    // 1. Check if it matches the global environment secret key
+    if (tokenPassword === adminSecret) {
+      return next();
+    }
+
+    // 2. Otherwise, check if it matches any admin user hash in the Google Sheet
+    const googleSheets = await getGoogleSheetsClient();
+    const spreadsheetId = process.env.SPREADSHEET_ID;
+    await ensureAdminUsersSheetExists(googleSheets, spreadsheetId);
+
+    const response = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: 'AdminUsers!A:D' });
+    const rows = response.data.values || [];
+
+    for (let i = 1; i < rows.length; i++) {
+      const storedHash = rows[i][2];
+      if (storedHash) {
+        const match = await bcrypt.compare(tokenPassword, storedHash);
+        if (match) {
+          return next(); // Valid admin password found!
+        }
+      }
+    }
+
+    return res.status(401).json({ status: 'error', message: 'Unauthorized: Invalid admin credentials.' });
+  } catch (error) {
+    console.error('Auth middleware error:', error);
+    return res.status(500).json({ status: 'error', message: 'Internal server error during authentication' });
   }
-  next();
 }
 
 async function getGoogleSheetsClient() {
@@ -239,7 +269,7 @@ app.post('/api/admin/update-password', async (req, res) => {
   }
 });
 
-// --- DRIVER REGISTRATION & PASSWORD SETUP (UPDATED) ---
+// --- DRIVER REGISTRATION & PASSWORD SETUP ---
 app.post('/api/drivers/register', async (req, res) => {
   try {
     const { driver_name, phone_number, vehicle_id, password } = req.body;
@@ -270,16 +300,13 @@ app.post('/api/drivers/register', async (req, res) => {
         rowIndex = i + 1;
         const existingStatus = (rows[i][3] || 'pending').trim().toLowerCase();
         existingPasswordHash = rows[i][4] || '';
-        
-        // Keep approved status if already approved, even when changing vehicles
         currentStatus = (existingStatus === 'approved') ? 'approved' : 'pending';
         break;
       }
     }
 
-    // Hash new password if provided, otherwise retain old password hash
     let finalPasswordHash = existingPasswordHash;
-    if (password && password.trim().isNotEmpty !== false) {
+    if (password && password.trim() !== '') {
       finalPasswordHash = await bcrypt.hash(password.trim(), 10);
     }
 
@@ -308,7 +335,7 @@ app.post('/api/drivers/register', async (req, res) => {
   }
 });
 
-// --- DRIVER LOGIN ENDPOINT (ADDED) ---
+// --- DRIVER LOGIN ENDPOINT ---
 app.post('/api/drivers/login', async (req, res) => {
   try {
     const { phone_number, password } = req.body;
@@ -358,7 +385,7 @@ app.post('/api/drivers/login', async (req, res) => {
   }
 });
 
-// --- DRIVER FORGOT / RESET PASSWORD ENDPOINT (ADDED) ---
+// --- DRIVER FORGOT / RESET PASSWORD ENDPOINT ---
 app.post('/api/drivers/reset-password', async (req, res) => {
   try {
     const { phone_number, new_password } = req.body;
