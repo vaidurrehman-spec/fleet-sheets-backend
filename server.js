@@ -13,6 +13,17 @@ app.use(cors());
 const PORT = process.env.PORT || 3000;
 const liveFleetTracker = {};
 
+// --- SECURITY MIDDLEWARE (THE BOUNCER) ---
+function verifyAdminAuth(req, res, next) {
+  const adminSecret = process.env.ADMIN_SECRET_KEY || 'FALLBACK_SECRET_PASSWORD';
+  const authHeader = req.headers['authorization'];
+  
+  if (!authHeader || authHeader !== `Bearer ${adminSecret}`) {
+    return res.status(401).json({ status: 'error', message: 'Unauthorized: Access denied.' });
+  }
+  next();
+}
+
 async function getGoogleSheetsClient() {
   let auth;
   if (process.env.GOOGLE_CREDENTIALS_JSON) {
@@ -123,10 +134,15 @@ app.get('/api/health', (req, res) => {
 });
 
 app.post('/api/admin/login', (req, res) => {
-  res.status(200).json({ status: 'success', message: 'Authenticated successfully' });
+  const { password } = req.body;
+  const adminSecret = process.env.ADMIN_SECRET_KEY || 'FALLBACK_SECRET_PASSWORD';
+  if (password === adminSecret) {
+    return res.status(200).json({ status: 'success', message: 'Authenticated successfully' });
+  }
+  return res.status(401).json({ status: 'error', message: 'Invalid admin password' });
 });
 
-// --- DRIVER REGISTRATION & APPROVAL ROUTES ---
+// --- DRIVER REGISTRATION (PUBLIC FOR DRIVERS TO REGISTER) ---
 app.post('/api/drivers/register', async (req, res) => {
   try {
     const { driver_name, phone_number, vehicle_id } = req.body;
@@ -187,7 +203,8 @@ app.post('/api/drivers/register', async (req, res) => {
   }
 });
 
-app.get('/api/admin/drivers', async (req, res) => {
+// --- PROTECTED ADMIN ENDPOINTS (REQUIRES verifyAdminAuth) ---
+app.get('/api/admin/drivers', verifyAdminAuth, async (req, res) => {
   try {
     const googleSheets = await getGoogleSheetsClient();
     const spreadsheetId = process.env.SPREADSHEET_ID;
@@ -212,7 +229,7 @@ app.get('/api/admin/drivers', async (req, res) => {
   }
 });
 
-app.post('/api/admin/drivers/update-status', async (req, res) => {
+app.post('/api/admin/drivers/update-status', verifyAdminAuth, async (req, res) => {
   try {
     const { phone_number, status } = req.body;
     if (!phone_number || !status) {
@@ -244,8 +261,58 @@ app.post('/api/admin/drivers/update-status', async (req, res) => {
   }
 });
 
-// --- BILLING & DRIVER SUMMARIES ---
-app.get('/api/admin/billing-summary/:monthYear', async (req, res) => {
+app.get('/api/admin/driver-details/:driverName', verifyAdminAuth, async (req, res) => {
+  try {
+    const driverName = req.params.driverName.trim().toUpperCase();
+    const phoneParam = (req.query.phone || '').trim();
+
+    const googleSheets = await getGoogleSheetsClient();
+    const spreadsheetId = process.env.SPREADSHEET_ID;
+    
+    await ensureDriversSheetExists(googleSheets, spreadsheetId);
+
+    const response = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: 'Drivers!A:D' });
+    const rows = response.data.values || [];
+
+    let matchedRow = rows.slice(1).find(r => 
+      (r[0] || '').trim() === phoneParam || 
+      (r[1] || '').trim().toUpperCase() === driverName
+    );
+
+    let matchedVehicleId = matchedRow ? (matchedRow[2] || '').trim().toUpperCase().replace(/[\s-]/g, '') : null;
+    let matchedPhone = matchedRow ? (matchedRow[0] || '').trim() : 'N/A';
+    let matchedName = matchedRow ? (matchedRow[1] || '').trim().toUpperCase() : driverName;
+
+    let foundLocation = null;
+    for (const [vid, loc] of Object.entries(liveFleetTracker)) {
+      const cleanVid = vid.trim().toUpperCase().replace(/[\s-]/g, '');
+      if (cleanVid === matchedVehicleId || vid.trim().toUpperCase() === driverName) {
+        foundLocation = loc;
+        break;
+      }
+    }
+
+    let locationInfo = { 
+      latitude: foundLocation ? foundLocation.latitude : 'N/A', 
+      longitude: foundLocation ? foundLocation.longitude : 'N/A', 
+      speed: foundLocation ? foundLocation.speed : 0, 
+      heading: foundLocation ? 'Active on road' : 'Stationary', 
+      timestamp: foundLocation ? foundLocation.last_updated : 'No recent transmission' 
+    };
+    
+    res.status(200).json({ 
+      driver_name: matchedName, 
+      phone_number: matchedPhone,
+      vehicle_id: matchedVehicleId || 'N/A',
+      ...locationInfo 
+    });
+  } catch (error) {
+    console.error('Error fetching driver details:', error);
+    res.status(500).json({ error: 'Failed to fetch driver details' });
+  }
+});
+
+app.get('/api/admin/billing-summary/:monthYear', verifyAdminAuth, async (req, res) => {
   try {
     const sheetName = req.params.monthYear;
     const googleSheets = await getGoogleSheetsClient();
@@ -293,13 +360,12 @@ app.get('/api/admin/billing-summary/:monthYear', async (req, res) => {
   }
 });
 
-app.get('/api/admin/driver-summary/:monthYear', async (req, res) => {
+app.get('/api/admin/driver-summary/:monthYear', verifyAdminAuth, async (req, res) => {
   req.url = `/api/admin/billing-summary/${req.params.monthYear}`;
   return app._router.handle(req, res);
 });
 
-// --- COMPREHENSIVE EXCEL EXPORT (WITH SUNDAYS & HOLIDAYS) ---
-app.get('/api/admin/export-excel/:monthYear', async (req, res) => {
+app.get('/api/admin/export-excel/:monthYear', verifyAdminAuth, async (req, res) => {
   try {
     const sheetName = req.params.monthYear;
     const googleSheets = await getGoogleSheetsClient();
@@ -309,7 +375,6 @@ app.get('/api/admin/export-excel/:monthYear', async (req, res) => {
     const rows = response.data.values || [];
     const workbook = new ExcelJS.Workbook();
 
-    // 1. RAW FLEET LOGS SHEET
     const logSheet = workbook.addWorksheet('Monthly Fleet Logs');
     logSheet.columns = [
       { header: 'Start Time', key: 'start_timestamp', width: 20 },
@@ -364,7 +429,6 @@ app.get('/api/admin/export-excel/:monthYear', async (req, res) => {
       }
     }
 
-    // 2. BILLING SUMMARY SHEET
     const summarySheet = workbook.addWorksheet('Billing Summary');
     summarySheet.columns = [
       { header: 'Category / Name', key: 'name', width: 30 },
@@ -383,13 +447,11 @@ app.get('/api/admin/export-excel/:monthYear', async (req, res) => {
       summarySheet.addRow({ name: client, trips: data.total_trips, km: parseFloat(data.total_km.toFixed(2)) });
     }
 
-    // Parse Month and Year
     const [monthStr, yearStr] = sheetName.split(' ');
     const monthIndex = new Date(`${monthStr} 1, ${yearStr || new Date().getFullYear()}`).getMonth();
     const year = parseInt(yearStr) || new Date().getFullYear();
     const daysInMonth = new Date(year, monthIndex + 1, 0).getDate();
 
-    // 3. VEHICLE TEMPLATE TABS WITH CALENDAR (SUNDAYS & HOLIDAYS)
     for (const [vehicleId, recordedTrips] of Object.entries(vehicleTripsMap)) {
       const ws = workbook.addWorksheet(vehicleId);
       
