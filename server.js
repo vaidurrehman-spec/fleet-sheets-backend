@@ -48,9 +48,9 @@ async function ensureDriversSheetExists(googleSheets, spreadsheetId) {
     });
     await googleSheets.spreadsheets.values.update({
       spreadsheetId,
-      range: 'Drivers!A1:D1',
+      range: 'Drivers!A1:E1',
       valueInputOption: 'USER_ENTERED',
-      resource: { values: [['Phone Number', 'Driver Name', 'Vehicle ID', 'Status']] }
+      resource: { values: [['Phone Number', 'Driver Name', 'Vehicle ID', 'Status', 'Password']] }
     });
   }
 }
@@ -239,10 +239,10 @@ app.post('/api/admin/update-password', async (req, res) => {
   }
 });
 
-// --- DRIVER REGISTRATION (PUBLIC FOR DRIVERS TO REGISTER) ---
+// --- DRIVER REGISTRATION & PASSWORD SETUP (UPDATED) ---
 app.post('/api/drivers/register', async (req, res) => {
   try {
-    const { driver_name, phone_number, vehicle_id } = req.body;
+    const { driver_name, phone_number, vehicle_id, password } = req.body;
     if (!driver_name || !phone_number || !vehicle_id) {
       return res.status(400).json({ status: 'error', message: 'Missing required fields.' });
     }
@@ -259,36 +259,44 @@ app.post('/api/drivers/register', async (req, res) => {
     const spreadsheetId = process.env.SPREADSHEET_ID;
     await ensureDriversSheetExists(googleSheets, spreadsheetId);
 
-    const response = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: 'Drivers!A:D' });
+    const response = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: 'Drivers!A:E' });
     const rows = response.data.values || [];
     let rowIndex = -1;
     let currentStatus = 'pending';
+    let existingPasswordHash = '';
 
     for (let i = 1; i < rows.length; i++) {
       if ((rows[i][0] || '').trim() === normalizedPhone) {
         rowIndex = i + 1;
-        const oldVehicle = (rows[i][2] || '').trim().toUpperCase();
-        currentStatus = (rows[i][3] || 'pending').trim().toLowerCase();
-
-        if (oldVehicle !== normalizedVehicle) {
-          currentStatus = 'pending';
-          await googleSheets.spreadsheets.values.update({
-            spreadsheetId,
-            range: `Drivers!B${rowIndex}:D${rowIndex}`,
-            valueInputOption: 'USER_ENTERED',
-            resource: { values: [[normalizedName, normalizedVehicle, 'pending']] },
-          });
-        }
+        const existingStatus = (rows[i][3] || 'pending').trim().toLowerCase();
+        existingPasswordHash = rows[i][4] || '';
+        
+        // Keep approved status if already approved, even when changing vehicles
+        currentStatus = (existingStatus === 'approved') ? 'approved' : 'pending';
         break;
       }
     }
 
-    if (rowIndex === -1) {
+    // Hash new password if provided, otherwise retain old password hash
+    let finalPasswordHash = existingPasswordHash;
+    if (password && password.trim().isNotEmpty !== false) {
+      finalPasswordHash = await bcrypt.hash(password.trim(), 10);
+    }
+
+    if (rowIndex !== -1) {
+      await googleSheets.spreadsheets.values.update({
+        spreadsheetId,
+        range: `Drivers!B${rowIndex}:E${rowIndex}`,
+        valueInputOption: 'USER_ENTERED',
+        resource: { values: [[normalizedName, normalizedVehicle, currentStatus, finalPasswordHash]] },
+      });
+    } else {
+      const defaultNewHash = password ? await bcrypt.hash(password.trim(), 10) : '';
       await googleSheets.spreadsheets.values.append({
         spreadsheetId,
-        range: 'Drivers!A:D',
+        range: 'Drivers!A:E',
         valueInputOption: 'USER_ENTERED',
-        resource: { values: [[normalizedPhone, normalizedName, normalizedVehicle, 'pending']] },
+        resource: { values: [[normalizedPhone, normalizedName, normalizedVehicle, 'pending', defaultNewHash]] },
       });
       currentStatus = 'pending';
     }
@@ -297,6 +305,98 @@ app.post('/api/drivers/register', async (req, res) => {
   } catch (error) {
     console.error('Error in driver registration:', error);
     return res.status(500).json({ status: 'error', message: 'Internal server error' });
+  }
+});
+
+// --- DRIVER LOGIN ENDPOINT (ADDED) ---
+app.post('/api/drivers/login', async (req, res) => {
+  try {
+    const { phone_number, password } = req.body;
+    if (!phone_number || !password) {
+      return res.status(400).json({ status: 'error', message: 'Phone number and password required.' });
+    }
+
+    const googleSheets = await getGoogleSheetsClient();
+    const spreadsheetId = process.env.SPREADSHEET_ID;
+    await ensureDriversSheetExists(googleSheets, spreadsheetId);
+
+    const response = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: 'Drivers!A:E' });
+    const rows = response.data.values || [];
+
+    let matchedDriver = null;
+    for (let i = 1; i < rows.length; i++) {
+      if ((rows[i][0] || '').trim() === phone_number.trim()) {
+        matchedDriver = {
+          phone_number: rows[i][0],
+          driver_name: rows[i][1],
+          vehicle_id: rows[i][2],
+          status: rows[i][3] || 'pending',
+          passwordHash: rows[i][4] || ''
+        };
+        break;
+      }
+    }
+
+    if (!matchedDriver) {
+      return res.status(404).json({ status: 'error', message: 'Driver not found. Please register first.' });
+    }
+
+    const passwordMatch = await bcrypt.compare(password.trim(), matchedDriver.passwordHash);
+    if (!passwordMatch) {
+      return res.status(401).json({ status: 'error', message: 'Incorrect password.' });
+    }
+
+    return res.status(200).json({
+      status: 'success',
+      driver_name: matchedDriver.driver_name,
+      vehicle_id: matchedDriver.vehicle_id,
+      driver_status: matchedDriver.status
+    });
+  } catch (error) {
+    console.error('Driver login error:', error);
+    return res.status(500).json({ status: 'error', message: 'Internal server error' });
+  }
+});
+
+// --- DRIVER FORGOT / RESET PASSWORD ENDPOINT (ADDED) ---
+app.post('/api/drivers/reset-password', async (req, res) => {
+  try {
+    const { phone_number, new_password } = req.body;
+    if (!phone_number || !new_password) {
+      return res.status(400).json({ status: 'error', message: 'Phone number and new password required.' });
+    }
+
+    const googleSheets = await getGoogleSheetsClient();
+    const spreadsheetId = process.env.SPREADSHEET_ID;
+    await ensureDriversSheetExists(googleSheets, spreadsheetId);
+
+    const response = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: 'Drivers!A:E' });
+    const rows = response.data.values || [];
+    let rowIndex = -1;
+
+    for (let i = 1; i < rows.length; i++) {
+      if ((rows[i][0] || '').trim() === phone_number.trim()) {
+        rowIndex = i + 1;
+        break;
+      }
+    }
+
+    if (rowIndex === -1) {
+      return res.status(404).json({ status: 'error', message: 'Phone number not registered.' });
+    }
+
+    const hashedNewPassword = await bcrypt.hash(new_password.trim(), 10);
+    await googleSheets.spreadsheets.values.update({
+      spreadsheetId,
+      range: `Drivers!E${rowIndex}`,
+      valueInputOption: 'USER_ENTERED',
+      resource: { values: [[hashedNewPassword]] },
+    });
+
+    return res.status(200).json({ status: 'success', message: 'Password reset successfully!' });
+  } catch (error) {
+    console.error('Reset password error:', error);
+    return res.status(500).json({ status: 'error', message: 'Failed to reset password' });
   }
 });
 
