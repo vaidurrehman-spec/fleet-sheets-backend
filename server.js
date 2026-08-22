@@ -11,9 +11,38 @@ app.use(express.json());
 app.use(cors());  
 
 const PORT = process.env.PORT || 3000;
-
 const liveFleetTracker = {};
-let driversDB = [];
+
+async function getGoogleSheetsClient() {
+  let auth;
+  if (process.env.GOOGLE_CREDENTIALS_JSON) {
+    const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON.trim());
+    auth = new google.auth.GoogleAuth({ credentials, scopes: ['https://www.googleapis.com/auth/spreadsheets'] });
+  } else {
+    auth = new google.auth.GoogleAuth({ keyFile: 'credentials.json', scopes: ['https://www.googleapis.com/auth/spreadsheets'] });
+  }
+  const client = await auth.getClient();
+  return google.sheets({ version: 'v4', auth: client });
+}
+
+// Automatically ensures the 'Drivers' sheet and header row exist
+async function ensureDriversSheetExists(googleSheets, spreadsheetId) {
+  const spreadsheet = await googleSheets.spreadsheets.get({ spreadsheetId });
+  const sheetExists = spreadsheet.data.sheets.some(s => s.properties.title === 'Drivers');
+
+  if (!sheetExists) {
+    await googleSheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      resource: { requests: [{ addSheet: { properties: { title: 'Drivers' } } }] }
+    });
+    await googleSheets.spreadsheets.values.update({
+      spreadsheetId,
+      range: 'Drivers!A1:D1',
+      valueInputOption: 'USER_ENTERED',
+      resource: { values: [['Phone Number', 'Driver Name', 'Vehicle ID', 'Status']] }
+    });
+  }
+}
 
 function calculateDistance(lat1, lon1, lat2, lon2) {
   const R = 6371;
@@ -29,16 +58,7 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
 
 async function appendToGoogleSheet(tripData) {
   try {
-    let auth;
-    if (process.env.GOOGLE_CREDENTIALS_JSON) {
-      const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON.trim());
-      auth = new google.auth.GoogleAuth({ credentials, scopes: ['https://www.googleapis.com/auth/spreadsheets'] });
-    } else {
-      auth = new google.auth.GoogleAuth({ keyFile: 'credentials.json', scopes: ['https://www.googleapis.com/auth/spreadsheets'] });
-    }
-
-    const client = await auth.getClient();
-    const googleSheets = google.sheets({ version: 'v4', auth: client });
+    const googleSheets = await getGoogleSheetsClient();
     const spreadsheetId = process.env.SPREADSHEET_ID;
 
     const date = new Date();
@@ -101,109 +121,165 @@ async function appendToGoogleSheet(tripData) {
   }
 }
 
-app.post('/api/drivers/register', (req, res) => {
-  const { driver_name, phone_number, vehicle_id } = req.body;
-  if (!driver_name || !phone_number || !vehicle_id) {
-    return res.status(400).json({ status: 'error', message: 'Driver name, phone number, and vehicle ID are required.' });
-  }
-
-  const normalizedDriverName = driver_name.trim().toUpperCase();
-  const normalizedPhone = phone_number.trim();
-  const normalizedVehicleId = vehicle_id.trim().toUpperCase();
-
-  if (normalizedDriverName === 'INPUT TEXT') {
-    return res.status(400).json({ status: 'error', message: 'Invalid placeholder name.' });
-  }
-
-  let existingDriver = driversDB.find(d => d.phone_number === normalizedPhone);
-  
-  if (existingDriver) {
-    existingDriver.driver_name = normalizedDriverName;
-    if (existingDriver.vehicle_id !== normalizedVehicleId) {
-      existingDriver.vehicle_id = normalizedVehicleId;
-      existingDriver.status = 'pending';
+app.post('/api/drivers/register', async (req, res) => {
+  try {
+    const { driver_name, phone_number, vehicle_id } = req.body;
+    if (!driver_name || !phone_number || !vehicle_id) {
+      return res.status(400).json({ status: 'error', message: 'Missing required fields.' });
     }
-    return res.status(200).json({ status: existingDriver.status, message: `Current approval status: ${existingDriver.status}` });
-  }
 
-  driversDB.push({ 
-    driver_name: normalizedDriverName, 
-    phone_number: normalizedPhone, 
-    vehicle_id: normalizedVehicleId, 
-    status: 'pending' 
-  });
-  return res.status(200).json({ status: 'pending', message: 'Registration submitted successfully.' });
+    const normalizedName = driver_name.trim().toUpperCase();
+    const normalizedPhone = phone_number.trim();
+    const normalizedVehicle = vehicle_id.trim().toUpperCase();
+
+    if (normalizedName === 'INPUT TEXT') {
+      return res.status(400).json({ status: 'error', message: 'Invalid placeholder name.' });
+    }
+
+    const googleSheets = await getGoogleSheetsClient();
+    const spreadsheetId = process.env.SPREADSHEET_ID;
+
+    // Automatically create tab and headers if missing
+    await ensureDriversSheetExists(googleSheets, spreadsheetId);
+
+    const response = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: 'Drivers!A:D' });
+    const rows = response.data.values || [];
+    let rowIndex = -1;
+    let currentStatus = 'pending';
+
+    for (let i = 1; i < rows.length; i++) {
+      if ((rows[i][0] || '').trim() === normalizedPhone) {
+        rowIndex = i + 1;
+        const oldVehicle = (rows[i][2] || '').trim().toUpperCase();
+        currentStatus = (rows[i][3] || 'pending').trim().toLowerCase();
+
+        if (oldVehicle !== normalizedVehicle) {
+          currentStatus = 'pending';
+          await googleSheets.spreadsheets.values.update({
+            spreadsheetId,
+            range: `Drivers!B${rowIndex}:D${rowIndex}`,
+            valueInputOption: 'USER_ENTERED',
+            resource: { values: [[normalizedName, normalizedVehicle, 'pending']] },
+          });
+        }
+        break;
+      }
+    }
+
+    if (rowIndex === -1) {
+      await googleSheets.spreadsheets.values.append({
+        spreadsheetId,
+        range: 'Drivers!A:D',
+        valueInputOption: 'USER_ENTERED',
+        resource: { values: [[normalizedPhone, normalizedName, normalizedVehicle, 'pending']] },
+      });
+      currentStatus = 'pending';
+    }
+
+    return res.status(200).json({ status: currentStatus, message: `Current status: ${currentStatus}` });
+  } catch (error) {
+    console.error('Error in driver registration:', error);
+    return res.status(500).json({ status: 'error', message: 'Internal server error' });
+  }
 });
 
-app.get('/api/admin/drivers', (req, res) => {
-  return res.status(200).json({ status: 'success', drivers: driversDB });
+app.get('/api/admin/drivers', async (req, res) => {
+  try {
+    const googleSheets = await getGoogleSheetsClient();
+    const spreadsheetId = process.env.SPREADSHEET_ID;
+    
+    await ensureDriversSheetExists(googleSheets, spreadsheetId);
+
+    const response = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: 'Drivers!A:D' });
+    const rows = response.data.values || [];
+    
+    const drivers = rows.slice(1).map(r => ({
+      phone_number: (r[0] || '').trim(),
+      driver_name: (r[1] || '').trim().toUpperCase(),
+      vehicle_id: (r[2] || '').trim().toUpperCase(),
+      status: (r[3] || 'pending').trim().toLowerCase(),
+    }));
+
+    return res.status(200).json({ status: 'success', drivers });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to fetch drivers' });
+  }
 });
 
-app.post('/api/admin/drivers/update-status', (req, res) => {
-  const { driver_name, phone_number, status } = req.body;
-  const normalizedDriverName = driver_name.trim().toUpperCase();
-  
-  let driver = driversDB.find(d => 
-    d.driver_name.trim().toUpperCase() === normalizedDriverName && 
-    (!phone_number || d.phone_number === phone_number.trim())
-  );
+app.post('/api/admin/drivers/update-status', async (req, res) => {
+  try {
+    const { phone_number, status } = req.body;
+    if (!phone_number || !status) {
+      return res.status(400).json({ status: 'error', message: 'Phone number and status required.' });
+    }
 
-  if (driver) {
-    driver.status = status;
-    return res.status(200).json({ status: 'success', message: `Driver status updated to ${status}` });
+    const googleSheets = await getGoogleSheetsClient();
+    const spreadsheetId = process.env.SPREADSHEET_ID;
+    
+    await ensureDriversSheetExists(googleSheets, spreadsheetId);
+
+    const response = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: 'Drivers!A:D' });
+    const rows = response.data.values || [];
+
+    for (let i = 1; i < rows.length; i++) {
+      if ((rows[i][0] || '').trim() === phone_number.trim()) {
+        const rowIndex = i + 1;
+        await googleSheets.spreadsheets.values.update({
+          spreadsheetId,
+          range: `Drivers!D${rowIndex}`,
+          valueInputOption: 'USER_ENTERED',
+          resource: { values: [[status.trim().toLowerCase()]] },
+        });
+        return res.status(200).json({ status: 'success', message: `Driver status updated to ${status}` });
+      }
+    }
+    return res.status(404).json({ status: 'error', message: 'Driver not found.' });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to update status' });
   }
-  return res.status(404).json({ status: 'error', message: 'Driver not found.' });
 });
 
-app.get('/api/admin/driver-details/:driverName', (req, res) => {
-  const driverName = req.params.driverName.trim().toUpperCase();
-  const phoneParam = (req.query.phone || '').trim();
+app.get('/api/admin/driver-details/:driverName', async (req, res) => {
+  try {
+    const driverName = req.params.driverName.trim().toUpperCase();
+    const phoneParam = (req.query.phone || '').trim();
 
-  let driverEntry = driversDB.find(d => 
-    d.driver_name.trim().toUpperCase() === driverName && 
-    (!phoneParam || d.phone_number === phoneParam)
-  );
+    const googleSheets = await getGoogleSheetsClient();
+    const spreadsheetId = process.env.SPREADSHEET_ID;
+    
+    await ensureDriversSheetExists(googleSheets, spreadsheetId);
 
-  if (!driverEntry) {
-    driverEntry = driversDB.find(d => d.driver_name.trim().toUpperCase() === driverName);
+    const response = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: 'Drivers!A:D' });
+    const rows = response.data.values || [];
+
+    let matchedRow = rows.slice(1).find(r => (r[0] || '').trim() === phoneParam || (r[1] || '').trim().toUpperCase() === driverName);
+    let matchedVehicleId = matchedRow ? (matchedRow[2] || '').trim().toUpperCase() : null;
+    let matchedPhone = matchedRow ? (matchedRow[0] || '').trim() : 'N/A';
+
+    let locationInfo = { latitude: 'N/A', longitude: 'N/A', speed: 0, heading: 'Stationary', timestamp: 'No transmission' };
+    if (matchedVehicleId && liveFleetTracker[matchedVehicleId]) {
+      const loc = liveFleetTracker[matchedVehicleId];
+      locationInfo = { latitude: loc.latitude, longitude: loc.longitude, speed: loc.speed, heading: 'Active on road', timestamp: loc.last_updated };
+    }
+    
+    res.status(200).json({ 
+      driver_name: driverName, 
+      phone_number: matchedPhone,
+      vehicle_id: matchedVehicleId || 'N/A',
+      ...locationInfo 
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch driver details' });
   }
-
-  let matchedVehicleId = driverEntry ? driverEntry.vehicle_id : null;
-
-  let locationInfo = { latitude: 'N/A', longitude: 'N/A', speed: 0, heading: 'Stationary', timestamp: 'No transmission' };
-  if (matchedVehicleId && liveFleetTracker[matchedVehicleId]) {
-    const loc = liveFleetTracker[matchedVehicleId];
-    locationInfo = { latitude: loc.latitude, longitude: loc.longitude, speed: loc.speed, heading: 'Active on road', timestamp: loc.last_updated };
-  }
-  
-  res.status(200).json({ 
-    driver_name: driverName, 
-    phone_number: driverEntry ? driverEntry.phone_number : 'N/A',
-    vehicle_id: matchedVehicleId || 'N/A',
-    ...locationInfo 
-  });
 });
 
 app.get('/api/admin/billing-summary/:monthYear', async (req, res) => {
   try {
     const sheetName = req.params.monthYear;
-    let auth;
-    if (process.env.GOOGLE_CREDENTIALS_JSON) {
-      const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON.trim());
-      auth = new google.auth.GoogleAuth({ credentials, scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'] });
-    } else {
-      auth = new google.auth.GoogleAuth({ keyFile: 'credentials.json', scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'] });
-    }
-
-    const client = await auth.getClient();
-    const googleSheets = google.sheets({ version: 'v4', auth: client });
+    const googleSheets = await getGoogleSheetsClient();
     const spreadsheetId = process.env.SPREADSHEET_ID;
 
-    const response = await googleSheets.spreadsheets.values.get({
-      spreadsheetId,
-      range: `${sheetName}!A:K`,
-    });
-
+    const response = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: `${sheetName}!A:K` });
     const rows = response.data.values;
     if (!rows || rows.length < 2) {
       return res.status(200).json({ month: sheetName, client_totals: [], driver_totals: [] });
@@ -239,13 +315,8 @@ app.get('/api/admin/billing-summary/:monthYear', async (req, res) => {
       total_km: parseFloat(driverMap[driverName].total_km.toFixed(2))
     }));
 
-    return res.status(200).json({ 
-      month: sheetName, 
-      client_totals: clientTotals, 
-      driver_totals: driverTotals 
-    });
+    return res.status(200).json({ month: sheetName, client_totals: clientTotals, driver_totals: driverTotals });
   } catch (error) {
-    console.error('Error generating summary:', error);
     return res.status(500).json({ error: 'Failed to calculate summary data' });
   }
 });
@@ -258,16 +329,7 @@ app.get('/api/admin/driver-summary/:monthYear', async (req, res) => {
 app.get('/api/admin/export-excel/:monthYear', async (req, res) => {
   try {
     const sheetName = req.params.monthYear;
-    let auth;
-    if (process.env.GOOGLE_CREDENTIALS_JSON) {
-      const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON.trim());
-      auth = new google.auth.GoogleAuth({ credentials, scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'] });
-    } else {
-      auth = new google.auth.GoogleAuth({ keyFile: 'credentials.json', scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'] });
-    }
-
-    const client = await auth.getClient();
-    const googleSheets = google.sheets({ version: 'v4', auth: client });
+    const googleSheets = await getGoogleSheetsClient();
     const spreadsheetId = process.env.SPREADSHEET_ID;
 
     const response = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: `${sheetName}!A:K` });
@@ -313,16 +375,7 @@ app.get('/api/drivers/history/:monthYear/:driverName', async (req, res) => {
   try {
     const { monthYear } = req.params;
     const driverName = req.params.driverName.trim().toUpperCase();
-    let auth;
-    if (process.env.GOOGLE_CREDENTIALS_JSON) {
-      const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON.trim());
-      auth = new google.auth.GoogleAuth({ credentials, scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'] });
-    } else {
-      auth = new google.auth.GoogleAuth({ keyFile: 'credentials.json', scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'] });
-    }
-
-    const client = await auth.getClient();
-    const googleSheets = google.sheets({ version: 'v4', auth: client });
+    const googleSheets = await getGoogleSheetsClient();
     const spreadsheetId = process.env.SPREADSHEET_ID;
 
     const response = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: `${monthYear}!A:K` });
