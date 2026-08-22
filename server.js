@@ -25,7 +25,6 @@ async function getGoogleSheetsClient() {
   return google.sheets({ version: 'v4', auth: client });
 }
 
-// Automatically ensures the 'Drivers' sheet and header row exist
 async function ensureDriversSheetExists(googleSheets, spreadsheetId) {
   const spreadsheet = await googleSheets.spreadsheets.get({ spreadsheetId });
   const sheetExists = spreadsheet.data.sheets.some(s => s.properties.title === 'Drivers');
@@ -139,7 +138,6 @@ app.post('/api/drivers/register', async (req, res) => {
     const googleSheets = await getGoogleSheetsClient();
     const spreadsheetId = process.env.SPREADSHEET_ID;
 
-    // Automatically create tab and headers if missing
     await ensureDriversSheetExists(googleSheets, spreadsheetId);
 
     const response = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: 'Drivers!A:D' });
@@ -335,8 +333,9 @@ app.get('/api/admin/export-excel/:monthYear', async (req, res) => {
     const response = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: `${sheetName}!A:K` });
     const rows = response.data.values;
     const workbook = new ExcelJS.Workbook();
+    
+    // 1. Raw Trip Logs Sheet
     const logSheet = workbook.addWorksheet('Monthly Fleet Logs');
-
     logSheet.columns = [
       { header: 'Start Time', key: 'start_timestamp', width: 20 },
       { header: 'End Time', key: 'timestamp', width: 20 },
@@ -351,6 +350,9 @@ app.get('/api/admin/export-excel/:monthYear', async (req, res) => {
       { header: 'GPS Dist (km)', key: 'gps_dist', width: 15 },
     ];
 
+    const clientMap = {};
+    const driverMap = {};
+
     if (rows && rows.length > 1) {
       for (let i = 1; i < rows.length; i++) {
         const r = rows[i];
@@ -359,11 +361,42 @@ app.get('/api/admin/export-excel/:monthYear', async (req, res) => {
           start_odometer: r[5] || '', end_odometer: r[6] || '', manual_dist: r[7] || '',
           start_gps: r[8] || '', end_gps: r[9] || '', gps_dist: r[10] || '',
         });
+
+        const customerName = (r[4] || 'GENERAL CLIENT').trim().toUpperCase();
+        const driverName = (r[3] || 'UNKNOWN DRIVER').trim().toUpperCase();
+        const manualDist = parseFloat(r[7]) || 0;
+
+        if (!clientMap[customerName]) clientMap[customerName] = { total_trips: 0, total_km: 0 };
+        clientMap[customerName].total_trips += 1;
+        clientMap[customerName].total_km += manualDist;
+
+        if (!driverMap[driverName]) driverMap[driverName] = { total_trips: 0, total_km: 0 };
+        driverMap[driverName].total_trips += 1;
+        driverMap[driverName].total_km += manualDist;
       }
     }
 
+    // 2. Billing Summary Sheet inside the Excel file
+    const summarySheet = workbook.addWorksheet('Billing Summary');
+    summarySheet.columns = [
+      { header: 'Category / Name', key: 'name', width: 30 },
+      { header: 'Total Trips', key: 'trips', width: 15 },
+      { header: 'Total Distance (km)', key: 'km', width: 20 },
+    ];
+
+    summarySheet.addRow({ name: '--- DRIVER SUMMARIES ---', trips: '', km: '' });
+    for (const [driver, data] of Object.entries(driverMap)) {
+      summarySheet.addRow({ name: driver, trips: data.total_trips, km: parseFloat(data.total_km.toFixed(2)) });
+    }
+
+    summarySheet.addRow({ name: '', trips: '', km: '' });
+    summarySheet.addRow({ name: '--- CLIENT / CUSTOMER SUMMARIES ---', trips: '', km: '' });
+    for (const [client, data] of Object.entries(clientMap)) {
+      summarySheet.addRow({ name: client, trips: data.total_trips, km: parseFloat(data.total_km.toFixed(2)) });
+    }
+
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename=Fleet_Report_${sheetName.replace(' ', '_')}.xlsx`);
+    res.setHeader('Content-Disposition', `attachment; filename=Fleet_Billing_Report_${sheetName.replace(' ', '_')}.xlsx`);
     await workbook.xlsx.write(res);
     res.end();
   } catch (error) {
