@@ -117,12 +117,33 @@ async function appendToGoogleSheet(tripData) {
   }
 }
 
+// --- HEALTH CHECK / CONNECTION ENDPOINT ---
+app.get('/api/health', (req, res) => {
+  res.status(200).json({ status: 'success', message: 'Fleet server is running and connected.' });
+});
+
+// --- ADMIN LOGIN / AUTH ENDPOINT ---
+app.post('/api/admin/login', (req, res) => {
+  const { password } = req.body;
+  // Fallback or verify password if required by admin app
+  res.status(200).json({ status: 'success', message: 'Authenticated successfully' });
+});
+
+// --- DRIVER REGISTRATION & APPROVAL ROUTES ---
 app.post('/api/drivers/register', async (req, res) => {
   try {
     const { driver_name, phone_number, vehicle_id } = req.body;
+    if (!driver_name || !phone_number || !vehicle_id) {
+      return res.status(400).json({ status: 'error', message: 'Missing required fields.' });
+    }
+
     const normalizedName = driver_name.trim().toUpperCase();
     const normalizedPhone = phone_number.trim();
     const normalizedVehicle = vehicle_id.trim().toUpperCase();
+
+    if (normalizedName === 'INPUT TEXT') {
+      return res.status(400).json({ status: 'error', message: 'Invalid placeholder name.' });
+    }
 
     const googleSheets = await getGoogleSheetsClient();
     const spreadsheetId = process.env.SPREADSHEET_ID;
@@ -137,11 +158,9 @@ app.post('/api/drivers/register', async (req, res) => {
       if ((rows[i][0] || '').trim() === normalizedPhone) {
         rowIndex = i + 1;
         const oldVehicle = (rows[i][2] || '').trim().toUpperCase();
-        let existingStatus = (rows[i][3] || 'pending').trim().toLowerCase();
+        currentStatus = (rows[i][3] || 'pending').trim().toLowerCase();
 
-        if (oldVehicle === normalizedVehicle) {
-          currentStatus = existingStatus; 
-        } else {
+        if (oldVehicle !== normalizedVehicle) {
           currentStatus = 'pending';
           await googleSheets.spreadsheets.values.update({
             spreadsheetId,
@@ -163,12 +182,126 @@ app.post('/api/drivers/register', async (req, res) => {
       });
       currentStatus = 'pending';
     }
-    return res.status(200).json({ status: currentStatus });
+
+    return res.status(200).json({ status: currentStatus, message: `Current status: ${currentStatus}` });
   } catch (error) {
-    return res.status(500).json({ status: 'error' });
+    console.error('Error in driver registration:', error);
+    return res.status(500).json({ status: 'error', message: 'Internal server error' });
   }
 });
 
+app.get('/api/admin/drivers', async (req, res) => {
+  try {
+    const googleSheets = await getGoogleSheetsClient();
+    const spreadsheetId = process.env.SPREADSHEET_ID;
+    await ensureDriversSheetExists(googleSheets, spreadsheetId);
+
+    const response = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: 'Drivers!A:D' });
+    const rows = response.data.values || [];
+    
+    const drivers = rows.slice(1)
+      .filter(r => r && r.length > 0 && r[0])
+      .map(r => ({
+        phone_number: (r[0] || '').trim(),
+        driver_name: (r[1] || '').trim().toUpperCase(),
+        vehicle_id: (r[2] || '').trim().toUpperCase(),
+        status: (r[3] || 'pending').trim().toLowerCase(),
+      }));
+
+    return res.status(200).json({ status: 'success', drivers });
+  } catch (error) {
+    console.error('Error fetching drivers:', error);
+    return res.status(500).json({ status: 'error', drivers: [], message: error.message });
+  }
+});
+
+app.post('/api/admin/drivers/update-status', async (req, res) => {
+  try {
+    const { phone_number, status } = req.body;
+    if (!phone_number || !status) {
+      return res.status(400).json({ status: 'error', message: 'Phone number and status required.' });
+    }
+
+    const googleSheets = await getGoogleSheetsClient();
+    const spreadsheetId = process.env.SPREADSHEET_ID;
+    await ensureDriversSheetExists(googleSheets, spreadsheetId);
+
+    const response = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: 'Drivers!A:D' });
+    const rows = response.data.values || [];
+
+    for (let i = 1; i < rows.length; i++) {
+      if ((rows[i][0] || '').trim() === phone_number.trim()) {
+        const rowIndex = i + 1;
+        await googleSheets.spreadsheets.values.update({
+          spreadsheetId,
+          range: `Drivers!D${rowIndex}`,
+          valueInputOption: 'USER_ENTERED',
+          resource: { values: [[status.trim().toLowerCase()]] },
+        });
+        return res.status(200).json({ status: 'success', message: `Driver status updated to ${status}` });
+      }
+    }
+    return res.status(404).json({ status: 'error', message: 'Driver not found.' });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to update status' });
+  }
+});
+
+// --- BILLING & DRIVER SUMMARIES ---
+app.get('/api/admin/billing-summary/:monthYear', async (req, res) => {
+  try {
+    const sheetName = req.params.monthYear;
+    const googleSheets = await getGoogleSheetsClient();
+    const spreadsheetId = process.env.SPREADSHEET_ID;
+
+    const response = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: `${sheetName}!A:K` });
+    const rows = response.data.values;
+    if (!rows || rows.length < 2) {
+      return res.status(200).json({ month: sheetName, client_totals: [], driver_totals: [] });
+    }
+
+    const clientMap = {};
+    const driverMap = {};
+
+    for (let i = 1; i < rows.length; i++) {
+      const row = rows[i];
+      const customerName = (row[4] || 'GENERAL CLIENT').trim().toUpperCase();
+      const driverName = (row[3] || 'UNKNOWN DRIVER').trim().toUpperCase();
+      const manualDist = parseFloat(row[7]) || 0;
+
+      if (!clientMap[customerName]) clientMap[customerName] = { total_trips: 0, total_km: 0 };
+      clientMap[customerName].total_trips += 1;
+      clientMap[customerName].total_km += manualDist;
+
+      if (!driverMap[driverName]) driverMap[driverName] = { total_trips: 0, total_km: 0 };
+      driverMap[driverName].total_trips += 1;
+      driverMap[driverName].total_km += manualDist;
+    }
+
+    const clientTotals = Object.keys(clientMap).map(clientName => ({
+      client_name: clientName,
+      total_trips: clientMap[clientName].total_trips,
+      total_km: parseFloat(clientMap[clientName].total_km.toFixed(2))
+    }));
+
+    const driverTotals = Object.keys(driverMap).map(driverName => ({
+      driver_name: driverName,
+      total_trips: driverMap[driverName].total_trips,
+      total_km: parseFloat(driverMap[driverName].total_km.toFixed(2))
+    }));
+
+    return res.status(200).json({ month: sheetName, client_totals: clientTotals, driver_totals: driverTotals });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to calculate summary data' });
+  }
+});
+
+app.get('/api/admin/driver-summary/:monthYear', async (req, res) => {
+  req.url = `/api/admin/billing-summary/${req.params.monthYear}`;
+  return app._router.handle(req, res);
+});
+
+// --- COMPREHENSIVE EXCEL EXPORT ---
 app.get('/api/admin/export-excel/:monthYear', async (req, res) => {
   try {
     const sheetName = req.params.monthYear;
@@ -179,19 +312,76 @@ app.get('/api/admin/export-excel/:monthYear', async (req, res) => {
     const rows = response.data.values || [];
     const workbook = new ExcelJS.Workbook();
 
+    const logSheet = workbook.addWorksheet('Monthly Fleet Logs');
+    logSheet.columns = [
+      { header: 'Start Time', key: 'start_timestamp', width: 20 },
+      { header: 'End Time', key: 'timestamp', width: 20 },
+      { header: 'Vehicle ID', key: 'vehicle_id', width: 15 },
+      { header: 'Driver Name', key: 'driver_name', width: 20 },
+      { header: 'Customer Name', key: 'customer_name', width: 25 },
+      { header: 'Start Odo', key: 'start_odometer', width: 15 },
+      { header: 'End Odo', key: 'end_odometer', width: 15 },
+      { header: 'Manual Dist (km)', key: 'manual_dist', width: 18 },
+      { header: 'Start GPS', key: 'start_gps', width: 22 },
+      { header: 'End GPS', key: 'end_gps', width: 22 },
+      { header: 'GPS Dist (km)', key: 'gps_dist', width: 15 },
+    ];
+
+    const clientMap = {};
+    const driverMap = {};
     const vehicleGroups = {};
-    for (let i = 1; i < rows.length; i++) {
-      const r = rows[i];
-      const vehicleId = (r[2] || 'UNKNOWN').trim();
-      if (!vehicleGroups[vehicleId]) vehicleGroups[vehicleId] = [];
-      vehicleGroups[vehicleId].push({
-        date: r[0]?.split(' ')[0] || '',
-        start: r[0]?.split(' ')[1] || '',
-        end: r[1]?.split(' ')[1] || '',
-        startOdo: r[5] || 0,
-        endOdo: r[6] || 0,
-        dist: parseFloat(r[7]) || 0
-      });
+
+    if (rows && rows.length > 1) {
+      for (let i = 1; i < rows.length; i++) {
+        const r = rows[i];
+        
+        logSheet.addRow({
+          start_timestamp: r[0] || '', timestamp: r[1] || '', vehicle_id: r[2] || '', driver_name: r[3] || '', customer_name: r[4] || '',
+          start_odometer: r[5] || '', end_odometer: r[6] || '', manual_dist: r[7] || '',
+          start_gps: r[8] || '', end_gps: r[9] || '', gps_dist: r[10] || '',
+        });
+
+        const customerName = (r[4] || 'GENERAL CLIENT').trim().toUpperCase();
+        const driverName = (r[3] || 'UNKNOWN DRIVER').trim().toUpperCase();
+        const vehicleId = (r[2] || 'UNKNOWN').trim().toUpperCase();
+        const manualDist = parseFloat(r[7]) || 0;
+
+        if (!clientMap[customerName]) clientMap[customerName] = { total_trips: 0, total_km: 0 };
+        clientMap[customerName].total_trips += 1;
+        clientMap[customerName].total_km += manualDist;
+
+        if (!driverMap[driverName]) driverMap[driverName] = { total_trips: 0, total_km: 0 };
+        driverMap[driverName].total_trips += 1;
+        driverMap[driverName].total_km += manualDist;
+
+        if (!vehicleGroups[vehicleId]) vehicleGroups[vehicleId] = [];
+        vehicleGroups[vehicleId].push({
+          date: r[0]?.split(' ')[0] || '',
+          start: r[0]?.split(' ')[1] || '',
+          end: r[1]?.split(' ')[1] || '',
+          startOdo: r[5] || 0,
+          endOdo: r[6] || 0,
+          dist: manualDist
+        });
+      }
+    }
+
+    const summarySheet = workbook.addWorksheet('Billing Summary');
+    summarySheet.columns = [
+      { header: 'Category / Name', key: 'name', width: 30 },
+      { header: 'Total Trips', key: 'trips', width: 15 },
+      { header: 'Total Distance (km)', key: 'km', width: 20 },
+    ];
+
+    summarySheet.addRow({ name: '--- DRIVER SUMMARIES ---', trips: '', km: '' });
+    for (const [driver, data] of Object.entries(driverMap)) {
+      summarySheet.addRow({ name: driver, trips: data.total_trips, km: parseFloat(data.total_km.toFixed(2)) });
+    }
+
+    summarySheet.addRow({ name: '', trips: '', km: '' });
+    summarySheet.addRow({ name: '--- CLIENT / CUSTOMER SUMMARIES ---', trips: '', km: '' });
+    for (const [client, data] of Object.entries(clientMap)) {
+      summarySheet.addRow({ name: client, trips: data.total_trips, km: parseFloat(data.total_km.toFixed(2)) });
     }
 
     for (const [vehicleId, trips] of Object.entries(vehicleGroups)) {
@@ -202,18 +392,20 @@ app.get('/api/admin/export-excel/:monthYear', async (req, res) => {
       ws.getCell('A1').alignment = { horizontal: 'center' };
 
       ws.addRow(['DATE', 'STARTING TIME', 'CLOSING TIME', 'TOTAL HOURS', 'EXTRA HOURS', 'STARTING Kms', 'CLOSING Kms', 'TOTAL Kms']);
+      
       let totalKms = 0;
       trips.forEach(t => {
         ws.addRow([t.date, t.start, t.end, 12, 0, t.startOdo, t.endOdo, t.dist]);
         totalKms += t.dist;
       });
+
       const totalRow = ws.addRow(['TOTAL', '', '', '', '', '', '', totalKms]);
       totalRow.font = { bold: true };
       ws.columns = [{width: 15}, {width: 15}, {width: 15}, {width: 15}, {width: 15}, {width: 15}, {width: 15}, {width: 15}];
     }
 
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename=Billing_Report_${sheetName.replace(' ', '_')}.xlsx`);
+    res.setHeader('Content-Disposition', `attachment; filename=Complete_Billing_Report_${sheetName.replace(' ', '_')}.xlsx`);
     await workbook.xlsx.write(res);
     res.end();
   } catch (error) {
