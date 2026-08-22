@@ -117,15 +117,12 @@ async function appendToGoogleSheet(tripData) {
   }
 }
 
-// --- HEALTH CHECK / CONNECTION ENDPOINT ---
+// --- HEALTH & AUTH CHECK ENDPOINTS ---
 app.get('/api/health', (req, res) => {
-  res.status(200).json({ status: 'success', message: 'Fleet server is running and connected.' });
+  res.status(200).json({ status: 'success', message: 'Fleet server is running.' });
 });
 
-// --- ADMIN LOGIN / AUTH ENDPOINT ---
 app.post('/api/admin/login', (req, res) => {
-  const { password } = req.body;
-  // Fallback or verify password if required by admin app
   res.status(200).json({ status: 'success', message: 'Authenticated successfully' });
 });
 
@@ -301,7 +298,7 @@ app.get('/api/admin/driver-summary/:monthYear', async (req, res) => {
   return app._router.handle(req, res);
 });
 
-// --- COMPREHENSIVE EXCEL EXPORT ---
+// --- COMPREHENSIVE EXCEL EXPORT (WITH SUNDAYS & HOLIDAYS) ---
 app.get('/api/admin/export-excel/:monthYear', async (req, res) => {
   try {
     const sheetName = req.params.monthYear;
@@ -312,6 +309,7 @@ app.get('/api/admin/export-excel/:monthYear', async (req, res) => {
     const rows = response.data.values || [];
     const workbook = new ExcelJS.Workbook();
 
+    // 1. RAW FLEET LOGS SHEET
     const logSheet = workbook.addWorksheet('Monthly Fleet Logs');
     logSheet.columns = [
       { header: 'Start Time', key: 'start_timestamp', width: 20 },
@@ -329,12 +327,11 @@ app.get('/api/admin/export-excel/:monthYear', async (req, res) => {
 
     const clientMap = {};
     const driverMap = {};
-    const vehicleGroups = {};
+    const vehicleTripsMap = {};
 
     if (rows && rows.length > 1) {
       for (let i = 1; i < rows.length; i++) {
         const r = rows[i];
-        
         logSheet.addRow({
           start_timestamp: r[0] || '', timestamp: r[1] || '', vehicle_id: r[2] || '', driver_name: r[3] || '', customer_name: r[4] || '',
           start_odometer: r[5] || '', end_odometer: r[6] || '', manual_dist: r[7] || '',
@@ -354,18 +351,20 @@ app.get('/api/admin/export-excel/:monthYear', async (req, res) => {
         driverMap[driverName].total_trips += 1;
         driverMap[driverName].total_km += manualDist;
 
-        if (!vehicleGroups[vehicleId]) vehicleGroups[vehicleId] = [];
-        vehicleGroups[vehicleId].push({
-          date: r[0]?.split(' ')[0] || '',
-          start: r[0]?.split(' ')[1] || '',
-          end: r[1]?.split(' ')[1] || '',
-          startOdo: r[5] || 0,
-          endOdo: r[6] || 0,
+        if (!vehicleTripsMap[vehicleId]) vehicleTripsMap[vehicleId] = {};
+        const rawDateStr = r[0]?.split(' ')[0] || '';
+        vehicleTripsMap[vehicleId][rawDateStr] = {
+          date: rawDateStr,
+          start: r[0]?.split(' ')[1] || '08:00 AM',
+          end: r[1]?.split(' ')[1] || '20:00 PM',
+          startOdo: r[5] || '',
+          endOdo: r[6] || '',
           dist: manualDist
-        });
+        };
       }
     }
 
+    // 2. BILLING SUMMARY SHEET
     const summarySheet = workbook.addWorksheet('Billing Summary');
     summarySheet.columns = [
       { header: 'Category / Name', key: 'name', width: 30 },
@@ -384,28 +383,59 @@ app.get('/api/admin/export-excel/:monthYear', async (req, res) => {
       summarySheet.addRow({ name: client, trips: data.total_trips, km: parseFloat(data.total_km.toFixed(2)) });
     }
 
-    for (const [vehicleId, trips] of Object.entries(vehicleGroups)) {
+    // Parse Month and Year
+    const [monthStr, yearStr] = sheetName.split(' ');
+    const monthIndex = new Date(`${monthStr} 1, ${yearStr || new Date().getFullYear()}`).getMonth();
+    const year = parseInt(yearStr) || new Date().getFullYear();
+    const daysInMonth = new Date(year, monthIndex + 1, 0).getDate();
+
+    // 3. VEHICLE TEMPLATE TABS WITH CALENDAR (SUNDAYS & HOLIDAYS)
+    for (const [vehicleId, recordedTrips] of Object.entries(vehicleTripsMap)) {
       const ws = workbook.addWorksheet(vehicleId);
+      
       ws.mergeCells('A1:H1');
       ws.getCell('A1').value = `VEHICLE NUMBER (${vehicleId}) FOR THE MONTH OF ${sheetName.toUpperCase()}`;
       ws.getCell('A1').font = { bold: true, size: 12 };
       ws.getCell('A1').alignment = { horizontal: 'center' };
 
       ws.addRow(['DATE', 'STARTING TIME', 'CLOSING TIME', 'TOTAL HOURS', 'EXTRA HOURS', 'STARTING Kms', 'CLOSING Kms', 'TOTAL Kms']);
-      
-      let totalKms = 0;
-      trips.forEach(t => {
-        ws.addRow([t.date, t.start, t.end, 12, 0, t.startOdo, t.endOdo, t.dist]);
-        totalKms += t.dist;
-      });
 
-      const totalRow = ws.addRow(['TOTAL', '', '', '', '', '', '', totalKms]);
+      let totalKmsMonthly = 0;
+
+      for (let day = 1; day <= daysInMonth; day++) {
+        const currentDate = new Date(year, monthIndex, day);
+        const dayFormatted = String(day).padStart(2, '0');
+        const monthFormatted = String(monthIndex + 1).padStart(2, '0');
+        const dateKey1 = `${dayFormatted}.${monthFormatted}.${year}`;
+        const dateKey2 = `${year}-${monthFormatted}-${dayFormatted}`;
+
+        const isSunday = currentDate.getDay() === 0;
+        const isFirstMayHoliday = (monthIndex === 4 && day === 1);
+
+        if (recordedTrips[dateKey1] || recordedTrips[dateKey2]) {
+          const t = recordedTrips[dateKey1] || recordedTrips[dateKey2];
+          ws.addRow([t.date, t.start, t.end, 12, 0, t.startOdo, t.endOdo, t.dist]);
+          totalKmsMonthly += t.dist;
+        } else if (isSunday) {
+          ws.addRow([dateKey1, 'SUNDAY', '', '', '', '', '', 0]);
+          ws.mergeCells(`B${ws.rowCount}:H${ws.rowCount}`);
+          ws.getCell(`B${ws.rowCount}`).alignment = { horizontal: 'center' };
+        } else if (isFirstMayHoliday) {
+          ws.addRow([dateKey1, 'MAY FIRST HOLIDAY', '', '', '', '', '', 0]);
+          ws.mergeCells(`B${ws.rowCount}:H${ws.rowCount}`);
+          ws.getCell(`B${ws.rowCount}`).alignment = { horizontal: 'center' };
+        } else {
+          ws.addRow([dateKey1, '', '', '', '', '', '', 0]);
+        }
+      }
+
+      const totalRow = ws.addRow(['TOTAL', '', '', '', '', '', '', totalKmsMonthly]);
       totalRow.font = { bold: true };
       ws.columns = [{width: 15}, {width: 15}, {width: 15}, {width: 15}, {width: 15}, {width: 15}, {width: 15}, {width: 15}];
     }
 
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename=Complete_Billing_Report_${sheetName.replace(' ', '_')}.xlsx`);
+    res.setHeader('Content-Disposition', `attachment; filename=Professional_Billing_Report_${sheetName.replace(' ', '_')}.xlsx`);
     await workbook.xlsx.write(res);
     res.end();
   } catch (error) {
@@ -413,6 +443,7 @@ app.get('/api/admin/export-excel/:monthYear', async (req, res) => {
   }
 });
 
+// --- TRIPS & LIVE FLEET TRACKING ---
 app.post('/api/trips/sync', async (req, res) => {
   try {
     const { vehicle_id, driver_name, trips } = req.body;
