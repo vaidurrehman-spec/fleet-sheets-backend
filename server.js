@@ -3,6 +3,7 @@ const cors = require('cors');
 const path = require('path');
 const { google } = require('googleapis');
 const ExcelJS = require('exceljs');
+const bcrypt = require('bcrypt');
 require('dotenv').config();
 
 const app = express();
@@ -50,6 +51,31 @@ async function ensureDriversSheetExists(googleSheets, spreadsheetId) {
       range: 'Drivers!A1:D1',
       valueInputOption: 'USER_ENTERED',
       resource: { values: [['Phone Number', 'Driver Name', 'Vehicle ID', 'Status']] }
+    });
+  }
+}
+
+async function ensureAdminUsersSheetExists(googleSheets, spreadsheetId) {
+  const spreadsheet = await googleSheets.spreadsheets.get({ spreadsheetId });
+  const sheetExists = spreadsheet.data.sheets.some(s => s.properties.title === 'AdminUsers');
+
+  if (!sheetExists) {
+    await googleSheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      resource: { requests: [{ addSheet: { properties: { title: 'AdminUsers' } } }] }
+    });
+    const defaultMasterHash = await bcrypt.hash('MasterPassword123', 10);
+    await googleSheets.spreadsheets.values.update({
+      spreadsheetId,
+      range: 'AdminUsers!A1:D1',
+      valueInputOption: 'USER_ENTERED',
+      resource: { values: [['Name', 'Username', 'PasswordHash', 'Role']] }
+    });
+    await googleSheets.spreadsheets.values.append({
+      spreadsheetId,
+      range: 'AdminUsers!A:D',
+      valueInputOption: 'USER_ENTERED',
+      resource: { values: [['Super Admin', 'admin', defaultMasterHash, 'master']] }
     });
   }
 }
@@ -140,6 +166,77 @@ app.post('/api/admin/login', (req, res) => {
     return res.status(200).json({ status: 'success', message: 'Authenticated successfully' });
   }
   return res.status(401).json({ status: 'error', message: 'Invalid admin password' });
+});
+
+// --- MULTI-ADMIN GOOGLE SHEET AUTHENTICATION ---
+app.post('/api/admin/multi-login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    const googleSheets = await getGoogleSheetsClient();
+    const spreadsheetId = process.env.SPREADSHEET_ID;
+    await ensureAdminUsersSheetExists(googleSheets, spreadsheetId);
+
+    const response = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: 'AdminUsers!A:D' });
+    const rows = response.data.values || [];
+
+    let matchedUser = null;
+    for (let i = 1; i < rows.length; i++) {
+      if ((rows[i][1] || '').trim().toLowerCase() === username.trim().toLowerCase()) {
+        matchedUser = { rowIdx: i + 1, name: rows[i][0], username: rows[i][1], hash: rows[i][2], role: rows[i][3] };
+        break;
+      }
+    }
+
+    if (!matchedUser) {
+      return res.status(404).json({ status: 'error', message: 'Admin user not found.' });
+    }
+
+    const passwordMatch = await bcrypt.compare(password, matchedUser.hash);
+    if (!passwordMatch) {
+      return res.status(401).json({ status: 'error', message: 'Incorrect password.' });
+    }
+
+    return res.status(200).json({ status: 'success', message: 'Login successful', name: matchedUser.name, role: matchedUser.role });
+  } catch (error) {
+    console.error('Login error:', error);
+    return res.status(500).json({ status: 'error', message: 'Internal server error' });
+  }
+});
+
+app.post('/api/admin/update-password', async (req, res) => {
+  try {
+    const { username, oldPassword, newPassword } = req.body;
+    const googleSheets = await getGoogleSheetsClient();
+    const spreadsheetId = process.env.SPREADSHEET_ID;
+
+    const response = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: 'AdminUsers!A:D' });
+    const rows = response.data.values || [];
+
+    for (let i = 1; i < rows.length; i++) {
+      if ((rows[i][1] || '').trim().toLowerCase() === username.trim().toLowerCase()) {
+        const rowIdx = i + 1;
+        const currentHash = rows[i][2];
+
+        const match = await bcrypt.compare(oldPassword, currentHash);
+        if (!match) {
+          return res.status(401).json({ status: 'error', message: 'Old password is incorrect.' });
+        }
+
+        const newHash = await bcrypt.hash(newPassword, 10);
+        await googleSheets.spreadsheets.values.update({
+          spreadsheetId,
+          range: `AdminUsers!C${rowIdx}`,
+          valueInputOption: 'USER_ENTERED',
+          resource: { values: [[newHash]] }
+        });
+
+        return res.status(200).json({ status: 'success', message: 'Password updated successfully!' });
+      }
+    }
+    return res.status(404).json({ status: 'error', message: 'User not found.' });
+  } catch (error) {
+    return res.status(500).json({ status: 'error', message: 'Failed to update password' });
+  }
 });
 
 // --- DRIVER REGISTRATION (PUBLIC FOR DRIVERS TO REGISTER) ---
