@@ -975,7 +975,7 @@ app.post('/api/trips/sync', async (req, res) => {
   }
 });
 
-// --- UPDATED VISION AI DISPENSER ROUTE WITH STRUCTURED JSON ---
+// --- SECURE VISION AI DISPENSER ROUTE WITH STRUCTURED JSON ---
 app.post('/api/analyze-dispenser', upload.single('image'), async (req, res) => {
   try {
     if (!req.file) {
@@ -1008,12 +1008,18 @@ app.post('/api/analyze-dispenser', upload.single('image'), async (req, res) => {
     let jsonString = response.text?.trim() || '{}';
     jsonString = jsonString.replace(/```json/g, '').replace(/```/g, '').trim();
 
+    const start = jsonString.indexOf('{');
+    const end = jsonString.lastIndexOf('}');
+    if (start !== -1 && end !== -1) {
+      jsonString = jsonString.substring(start, end + 1);
+    }
+
     const parsedData = JSON.parse(jsonString);
 
     return res.status(200).json({
-      qty: parsedData.qty || '0.00',
-      rate: parsedData.rate || '0.00',
-      total: parsedData.total || '0.00',
+      qty: parsedData.qty?.toString() || '0.00',
+      rate: parsedData.rate?.toString() || '0.00',
+      total: parsedData.total?.toString() || '0.00',
     });
 
   } catch (error) {
