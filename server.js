@@ -975,7 +975,7 @@ app.post('/api/trips/sync', async (req, res) => {
   }
 });
 
-// --- RAW OCR DISPENSER ROUTE ---
+// --- UPDATED VISION AI DISPENSER ROUTE WITH STRUCTURED JSON ---
 app.post('/api/analyze-dispenser', upload.single('image'), async (req, res) => {
   try {
     if (!req.file) {
@@ -989,17 +989,31 @@ app.post('/api/analyze-dispenser', upload.single('image'), async (req, res) => {
       },
     };
 
-    const prompt = 'Perform raw OCR on this gas or industrial dispenser display image. Read and return every number, label, and text visible on the screen exactly as it appears.';
+    const prompt = `
+    Analyze this gas or fuel dispenser image carefully. The digital values are displayed on separate screens across the panel:
+    1. "total": Look for the screen labeled "TOTAL (₹)" (showing total money like 575.21).
+    2. "qty": Look for the screen labeled "QTY (kg)" or similar quantity display (showing mass like 5.93).
+    3. "rate": Look for the screen labeled "RATE (₹/kg)" or unit price (showing the unit rate like 97.00).
+
+    Cross-check your math: 'qty' multiplied by 'rate' should roughly equal 'total'.
+    
+    Return ONLY a valid raw JSON object using these exact keys: "qty", "rate", "total". Do not include any markdown formatting like \`\`\`json.
+    `;
 
     const response = await ai.models.generateContent({
       model: 'gemini-3.7-flash',
       contents: [prompt, imagePart],
     });
 
-    const rawText = response.text ? response.text.trim() : '';
+    let jsonString = response.text?.trim() || '{}';
+    jsonString = jsonString.replace(/```json/g, '').replace(/```/g, '').trim();
+
+    const parsedData = JSON.parse(jsonString);
 
     return res.status(200).json({
-      raw_text: rawText,
+      qty: parsedData.qty || '0.00',
+      rate: parsedData.rate || '0.00',
+      total: parsedData.total || '0.00',
     });
 
   } catch (error) {
