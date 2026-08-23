@@ -545,6 +545,39 @@ app.get('/api/admin/drivers', verifyAdminAuth, async (req, res) => {
   }
 });
 
+// --- ADMIN FUEL LOGS ENDPOINT ---
+app.get('/api/admin/fuel-logs', verifyAdminAuth, async (req, res) => {
+  try {
+    const googleSheets = await getGoogleSheetsClient();
+    const spreadsheetId = process.env.SPREADSHEET_ID;
+    await ensureFuelSheetExists(googleSheets, spreadsheetId);
+
+    const response = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: 'FuelLogs!A:K' });
+    const rows = response.data.values || [];
+
+    const fuelLogs = rows.slice(1)
+      .filter(r => r && r.length > 0 && r[0])
+      .map(r => ({
+        timestamp: r[0] || '',
+        vehicle_id: (r[1] || '').trim().toUpperCase(),
+        driver_name: (r[2] || '').trim().toUpperCase(),
+        fuel_type: r[3] || 'CNG',
+        shift_time: r[4] || '',
+        quantity: r[5] || '',
+        unit: r[6] || 'KG',
+        total_cost: r[7] || '',
+        per_unit_rate: r[8] || '',
+        odometer: r[9] || '',
+        station_location: r[10] || ''
+      }));
+
+    return res.status(200).json({ status: 'success', fuel_logs: fuelLogs });
+  } catch (error) {
+    console.error('Error fetching fuel logs for admin:', error);
+    return res.status(500).json({ status: 'error', fuel_logs: [], message: error.message });
+  }
+});
+
 app.post('/api/admin/drivers/update-status', verifyAdminAuth, async (req, res) => {
   try {
     const { phone_number, status } = req.body;
