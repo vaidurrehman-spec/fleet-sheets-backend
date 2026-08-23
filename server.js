@@ -994,8 +994,8 @@ app.post('/api/analyze-dispenser', upload.single('image'), async (req, res) => {
                    'Return ONLY a valid raw JSON object using these exact keys: "qty", "rate", "total". ' +
                    'Do not include any markdown formatting like ```json.';
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-1.5-flash',
+    const response = id = await ai.models.generateContent({
+      model: 'gemini-3.7-flash',
       contents: [prompt, imagePart],
     });
 
