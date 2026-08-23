@@ -4,6 +4,8 @@ const path = require('path');
 const { google } = require('googleapis');
 const ExcelJS = require('exceljs');
 const bcrypt = require('bcrypt');
+const multer = require('multer');
+const { GoogleGenAI } = require('@google/genai');
 require('dotenv').config();
 
 const app = express();
@@ -13,6 +15,10 @@ app.use(cors());
 
 const PORT = process.env.PORT || 3000;
 const liveFleetTracker = {};
+const upload = multer({ storage: multer.memoryStorage() });
+
+// Initialize Gemini using your environment variable on Render
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 // --- DATE NORMALIZER HELPER FOR EXCEL EXPORT ---
 function normalizeDateKey(dateStr) {
@@ -966,6 +972,47 @@ app.post('/api/trips/sync', async (req, res) => {
     res.status(200).json({ status: 'success' });
   } catch (error) {
     res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// --- SECURE GEMINI VISION AI DISPENSER ROUTE ---
+app.post('/api/analyze-dispenser', upload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No image uploaded' });
+    }
+
+    const imagePart = {
+      inlineData: {
+        data: req.file.buffer.toString('base64'),
+        mimeType: req.file.mimetype || 'image/jpeg',
+      },
+    };
+
+    const prompt = 'Analyze this gas or industrial dispenser display image. ' +
+                   'Extract three values precisely: quantity (QTY kg or litres), rate (RATE per kg or litre), and total amount (TOTAL Rs). ' +
+                   'Return ONLY a valid raw JSON object using these exact keys: "qty", "rate", "total". ' +
+                   'Do not include any markdown formatting like ```json.';
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-1.5-flash',
+      contents: [prompt, imagePart],
+    });
+
+    let jsonString = response.text?.trim() || '{}';
+    jsonString = jsonString.replace(/```json/g, '').replace(/```/g, '').trim();
+
+    const parsedData = JSON.parse(jsonString);
+
+    return res.status(200).json({
+      qty: parsedData.qty || '0.00',
+      rate: parsedData.rate || '0.00',
+      total: parsedData.total || '0.00',
+    });
+
+  } catch (error) {
+    console.error('Server AI Error:', error);
+    return res.status(500).json({ error: 'Failed to process dispenser image' });
   }
 });
 
