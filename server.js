@@ -975,7 +975,7 @@ app.post('/api/trips/sync', async (req, res) => {
   }
 });
 
-// --- SECURE GEMINI VISION AI DISPENSER ROUTE ---
+// --- RAW OCR DISPENSER ROUTE ---
 app.post('/api/analyze-dispenser', upload.single('image'), async (req, res) => {
   try {
     if (!req.file) {
@@ -989,25 +989,17 @@ app.post('/api/analyze-dispenser', upload.single('image'), async (req, res) => {
       },
     };
 
-    const prompt = 'Analyze this gas or industrial dispenser display image. ' +
-                   'Extract three values precisely: quantity (QTY kg or litres), rate (RATE per kg or litre), and total amount (TOTAL Rs). ' +
-                   'Return ONLY a valid raw JSON object using these exact keys: "qty", "rate", "total". ' +
-                   'Do not include any markdown formatting like ```json.';
+    const prompt = 'Perform raw OCR on this gas or industrial dispenser display image. Read and return every number, label, and text visible on the screen exactly as it appears.';
 
-    const response = id = await ai.models.generateContent({
+    const response = await ai.models.generateContent({
       model: 'gemini-3.7-flash',
       contents: [prompt, imagePart],
     });
 
-    let jsonString = response.text?.trim() || '{}';
-    jsonString = jsonString.replace(/```json/g, '').replace(/```/g, '').trim();
-
-    const parsedData = JSON.parse(jsonString);
+    const rawText = response.text ? response.text.trim() : '';
 
     return res.status(200).json({
-      qty: parsedData.qty || '0.00',
-      rate: parsedData.rate || '0.00',
-      total: parsedData.total || '0.00',
+      raw_text: rawText,
     });
 
   } catch (error) {
