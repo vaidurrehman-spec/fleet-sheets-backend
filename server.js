@@ -14,6 +14,30 @@ app.use(cors());
 const PORT = process.env.PORT || 3000;
 const liveFleetTracker = {};
 
+// --- DATE NORMALIZER HELPER FOR EXCEL EXPORT ---
+function normalizeDateKey(dateStr) {
+  if (!dateStr) return '';
+  const cleanDate = dateStr.split(' ')[0].trim();
+  let parts = [];
+  
+  if (cleanDate.includes('/')) {
+    parts = cleanDate.split('/');
+  } else if (cleanDate.includes('-')) {
+    parts = cleanDate.split('-');
+  } else {
+    return cleanDate;
+  }
+
+  if (parts.length === 3) {
+    if (parts[0].length === 4) {
+      return `${parts[0]}-${parts[1].padStart(2, '0')}-${parts[2].padStart(2, '0')}`;
+    } else {
+      return `${parts[2]}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
+    }
+  }
+  return cleanDate;
+}
+
 // --- SECURE DYNAMIC ADMIN AUTH MIDDLEWARE ---
 async function verifyAdminAuth(req, res, next) {
   try {
@@ -25,12 +49,10 @@ async function verifyAdminAuth(req, res, next) {
     const tokenPassword = authHeader.split(' ')[1];
     const adminSecret = process.env.ADMIN_SECRET_KEY || 'FALLBACK_SECRET_PASSWORD';
 
-    // 1. Check if it matches the global environment secret key
     if (tokenPassword === adminSecret) {
       return next();
     }
 
-    // 2. Otherwise, check if it matches any admin user hash in the Google Sheet
     const googleSheets = await getGoogleSheetsClient();
     const spreadsheetId = process.env.SPREADSHEET_ID;
     await ensureAdminUsersSheetExists(googleSheets, spreadsheetId);
@@ -43,7 +65,7 @@ async function verifyAdminAuth(req, res, next) {
       if (storedHash) {
         const match = await bcrypt.compare(tokenPassword, storedHash);
         if (match) {
-          return next(); // Valid admin password found!
+          return next();
         }
       }
     }
@@ -216,7 +238,6 @@ app.post('/api/admin/login', (req, res) => {
   return res.status(401).json({ status: 'error', message: 'Invalid admin password' });
 });
 
-// --- MULTI-ADMIN GOOGLE SHEET AUTHENTICATION ---
 app.post('/api/admin/multi-login', async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -456,7 +477,6 @@ app.get('/api/drivers/history/:monthYear/:driverName', async (req, res) => {
 
     const spreadsheet = await googleSheets.spreadsheets.get({ spreadsheetId });
     
-    // 1. Fetch Trips from Monthly Sheet Tab
     let driverTrips = [];
     const tripSheetExists = spreadsheet.data.sheets.some(s => s.properties.title === monthYear);
     if (tripSheetExists) {
@@ -484,7 +504,6 @@ app.get('/api/drivers/history/:monthYear/:driverName', async (req, res) => {
       }
     }
 
-    // 2. Fetch Fuel Logs from FuelLogs Sheet Tab
     let driverFuelLogs = [];
     const fuelSheetExists = spreadsheet.data.sheets.some(s => s.properties.title === 'FuelLogs');
     if (fuelSheetExists) {
@@ -545,7 +564,6 @@ app.get('/api/admin/drivers', verifyAdminAuth, async (req, res) => {
   }
 });
 
-// --- ADMIN FUEL LOGS ENDPOINT ---
 app.get('/api/admin/fuel-logs', verifyAdminAuth, async (req, res) => {
   try {
     const googleSheets = await getGoogleSheetsClient();
@@ -714,7 +732,7 @@ app.get('/api/admin/driver-summary/:monthYear', verifyAdminAuth, async (req, res
   return app._router.handle(req, res);
 });
 
-// --- UPDATED EXCEL EXPORT ENDPOINT WITH FUEL STATEMENT TAB ---
+// --- UPDATED EXCEL EXPORT ENDPOINT WITH NORMALIZED DATE MAPPING ---
 app.get('/api/admin/export-excel/:monthYear', verifyAdminAuth, async (req, res) => {
   try {
     const sheetName = req.params.monthYear;
@@ -781,9 +799,11 @@ app.get('/api/admin/export-excel/:monthYear', verifyAdminAuth, async (req, res) 
         driverMap[driverName].total_km += manualDist;
 
         if (!vehicleTripsMap[vehicleId]) vehicleTripsMap[vehicleId] = {};
-        const rawDateStr = r[0]?.split(' ')[0] || '';
+        
+        // --- USING NORMALIZED DATE KEY ---
+        const rawDateStr = normalizeDateKey(r[0]);
         vehicleTripsMap[vehicleId][rawDateStr] = {
-          date: rawDateStr,
+          date: r[0]?.split(' ')[0] || '',
           start: r[0]?.split(' ')[1] || '08:00 AM',
           end: r[1]?.split(' ')[1] || '20:00 PM',
           startOdo: r[5] || '',
@@ -793,7 +813,7 @@ app.get('/api/admin/export-excel/:monthYear', verifyAdminAuth, async (req, res) 
       }
     }
 
-    // Process Fuel Logs by Vehicle & Date
+    // Process Fuel Logs with Normalized Date Key
     if (fuelRows && fuelRows.length > 1) {
       for (let i = 1; i < fuelRows.length; i++) {
         const f = fuelRows[i];
@@ -804,7 +824,9 @@ app.get('/api/admin/export-excel/:monthYear', verifyAdminAuth, async (req, res) 
         const unit = f[6] || 'KG';
         const cost = parseFloat(f[7]) || 0;
         const odo = f[9] || '';
-        const dateKey = fuelTimestamp.split(' ')[0] || '';
+        
+        // --- USING NORMALIZED DATE KEY ---
+        const dateKey = normalizeDateKey(fuelTimestamp);
 
         if (!vehicleFuelMap[fuelVehicle]) vehicleFuelMap[fuelVehicle] = {};
         if (!vehicleFuelMap[fuelVehicle][dateKey]) {
