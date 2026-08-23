@@ -121,9 +121,9 @@ async function ensureFuelSheetExists(googleSheets, spreadsheetId) {
     });
     await googleSheets.spreadsheets.values.update({
       spreadsheetId,
-      range: 'FuelLogs!A1:G1',
+      range: 'FuelLogs!A1:K1',
       valueInputOption: 'USER_ENTERED',
-      resource: { values: [['Timestamp', 'Vehicle ID', 'Driver Name', 'Fuel Type', 'Quantity / Liters', 'Total Cost (₹)', 'Odometer']] }
+      resource: { values: [['Timestamp', 'Vehicle ID', 'Driver Name', 'Fuel Type', 'Shift Time', 'Quantity', 'Unit', 'Total Cost (₹)', 'Per Unit Rate (₹)', 'Odometer', 'Station Location']] }
     });
   }
 }
@@ -445,7 +445,7 @@ app.post('/api/drivers/reset-password', async (req, res) => {
   }
 });
 
-// --- DRIVER HISTORY ENDPOINT ---
+// --- COMBINED DRIVER HISTORY ENDPOINT (Trips & Fuel Logs) ---
 app.get('/api/drivers/history/:monthYear/:driverName', async (req, res) => {
   try {
     const { monthYear, driverName } = req.params;
@@ -455,42 +455,64 @@ app.get('/api/drivers/history/:monthYear/:driverName', async (req, res) => {
     const spreadsheetId = process.env.SPREADSHEET_ID;
 
     const spreadsheet = await googleSheets.spreadsheets.get({ spreadsheetId });
-    const sheetExists = spreadsheet.data.sheets.some(s => s.properties.title === monthYear);
-
-    if (!sheetExists) {
-      return res.status(200).json({ trips: [] });
-    }
-
-    const response = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: `${monthYear}!A:K` });
-    const rows = response.data.values || [];
     
-    if (rows.length < 2) {
-      return res.status(200).json({ trips: [] });
-    }
-
-    const driverTrips = [];
-    for (let i = 1; i < rows.length; i++) {
-      const r = rows[i];
-      const rowDriver = (r[3] || '').trim().toUpperCase();
-
-      if (rowDriver === targetDriver) {
-        driverTrips.push({
-          start_timestamp: r[0] || '',
-          timestamp: r[1] || '',
-          vehicle_id: r[2] || '',
-          driver_name: r[3] || '',
-          customer_name: r[4] || '',
-          start_odometer: r[5] || '',
-          end_odometer: r[6] || '',
-          manual_dist: r[7] || '',
-          start_gps: r[8] || '',
-          end_gps: r[9] || '',
-          gps_dist: r[10] || '',
-        });
+    // 1. Fetch Trips from Monthly Sheet Tab
+    let driverTrips = [];
+    const tripSheetExists = spreadsheet.data.sheets.some(s => s.properties.title === monthYear);
+    if (tripSheetExists) {
+      const tripResponse = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: `${monthYear}!A:K` });
+      const tripRows = tripResponse.data.values || [];
+      
+      for (let i = 1; i < tripRows.length; i++) {
+        const r = tripRows[i];
+        const rowDriver = (r[3] || '').trim().toUpperCase();
+        if (rowDriver === targetDriver) {
+          driverTrips.push({
+            start_timestamp: r[0] || '',
+            timestamp: r[1] || '',
+            vehicle_id: r[2] || '',
+            driver_name: r[3] || '',
+            customer_name: r[4] || '',
+            start_odometer: r[5] || '',
+            end_odometer: r[6] || '',
+            manual_dist: r[7] || '',
+            start_gps: r[8] || '',
+            end_gps: r[9] || '',
+            gps_dist: r[10] || '',
+          });
+        }
       }
     }
 
-    return res.status(200).json({ trips: driverTrips });
+    // 2. Fetch Fuel Logs from FuelLogs Sheet Tab
+    let driverFuelLogs = [];
+    const fuelSheetExists = spreadsheet.data.sheets.some(s => s.properties.title === 'FuelLogs');
+    if (fuelSheetExists) {
+      const fuelResponse = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: 'FuelLogs!A:K' });
+      const fuelRows = fuelResponse.data.values || [];
+
+      for (let i = 1; i < fuelRows.length; i++) {
+        const r = fuelRows[i];
+        const rowDriver = (r[2] || '').trim().toUpperCase();
+        if (rowDriver === targetDriver) {
+          driverFuelLogs.push({
+            timestamp: r[0] || '',
+            vehicle_id: r[1] || '',
+            driver_name: r[2] || '',
+            fuel_type: r[3] || '',
+            shift_time: r[4] || '',
+            quantity: r[5] || '',
+            unit: r[6] || '',
+            total_cost: r[7] || '',
+            per_unit_rate: r[8] || '',
+            odometer: r[9] || '',
+            station_location: r[10] || ''
+          });
+        }
+      }
+    }
+
+    return res.status(200).json({ trips: driverTrips, fuel_logs: driverFuelLogs });
   } catch (error) {
     console.error('Error fetching driver history:', error);
     return res.status(500).json({ error: 'Failed to fetch driver history' });
@@ -659,16 +681,30 @@ app.get('/api/admin/driver-summary/:monthYear', verifyAdminAuth, async (req, res
   return app._router.handle(req, res);
 });
 
+// --- UPDATED EXCEL EXPORT ENDPOINT WITH FUEL STATEMENT TAB ---
 app.get('/api/admin/export-excel/:monthYear', verifyAdminAuth, async (req, res) => {
   try {
     const sheetName = req.params.monthYear;
     const googleSheets = await getGoogleSheetsClient();
     const spreadsheetId = process.env.SPREADSHEET_ID;
 
-    const response = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: `${sheetName}!A:K` });
-    const rows = response.data.values || [];
+    const spreadsheet = await googleSheets.spreadsheets.get({ spreadsheetId });
+    
+    // 1. Fetch Monthly Trips
+    const tripResponse = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: `${sheetName}!A:K` });
+    const rows = tripResponse.data.values || [];
+
+    // 2. Fetch Fuel Logs
+    let fuelRows = [];
+    const fuelSheetExists = spreadsheet.data.sheets.some(s => s.properties.title === 'FuelLogs');
+    if (fuelSheetExists) {
+      const fuelResponse = await googleSheets.spreadsheets.values.get({ spreadsheetId, range: 'FuelLogs!A:K' });
+      fuelRows = fuelResponse.data.values || [];
+    }
+
     const workbook = new ExcelJS.Workbook();
 
+    // --- SHEET 1: Monthly Fleet Logs ---
     const logSheet = workbook.addWorksheet('Monthly Fleet Logs');
     logSheet.columns = [
       { header: 'Start Time', key: 'start_timestamp', width: 20 },
@@ -687,6 +723,7 @@ app.get('/api/admin/export-excel/:monthYear', verifyAdminAuth, async (req, res) 
     const clientMap = {};
     const driverMap = {};
     const vehicleTripsMap = {};
+    const vehicleFuelMap = {};
 
     if (rows && rows.length > 1) {
       for (let i = 1; i < rows.length; i++) {
@@ -723,6 +760,38 @@ app.get('/api/admin/export-excel/:monthYear', verifyAdminAuth, async (req, res) 
       }
     }
 
+    // Process Fuel Logs by Vehicle & Date
+    if (fuelRows && fuelRows.length > 1) {
+      for (let i = 1; i < fuelRows.length; i++) {
+        const f = fuelRows[i];
+        const fuelTimestamp = f[0] || '';
+        const fuelVehicle = (f[1] || '').trim().toUpperCase();
+        const fuelType = f[3] || 'CNG';
+        const qty = parseFloat(f[5]) || 0;
+        const unit = f[6] || 'KG';
+        const cost = parseFloat(f[7]) || 0;
+        const odo = f[9] || '';
+        const dateKey = fuelTimestamp.split(' ')[0] || '';
+
+        if (!vehicleFuelMap[fuelVehicle]) vehicleFuelMap[fuelVehicle] = {};
+        if (!vehicleFuelMap[fuelVehicle][dateKey]) {
+          vehicleFuelMap[fuelVehicle][dateKey] = { petrol: 0, totalCost: 0, cngFills: [], startingOdo: odo, closingOdo: odo };
+        }
+
+        const dayRecord = vehicleFuelMap[fuelVehicle][dateKey];
+        dayRecord.totalCost += cost;
+        dayRecord.closingOdo = odo || dayRecord.closingOdo;
+        if (!dayRecord.startingOdo) dayRecord.startingOdo = odo;
+
+        if (fuelType === 'Petrol') {
+          dayRecord.petrol += qty;
+        } else if (fuelType === 'CNG') {
+          dayRecord.cngFills.push(`${qty} ${unit} (₹${cost})`);
+        }
+      }
+    }
+
+    // --- SHEET 2: Billing Summary ---
     const summarySheet = workbook.addWorksheet('Billing Summary');
     summarySheet.columns = [
       { header: 'Category / Name', key: 'name', width: 30 },
@@ -746,6 +815,7 @@ app.get('/api/admin/export-excel/:monthYear', verifyAdminAuth, async (req, res) 
     const year = parseInt(yearStr) || new Date().getFullYear();
     const daysInMonth = new Date(year, monthIndex + 1, 0).getDate();
 
+    // --- SHEET 3+: Vehicle Trip Cards ---
     for (const [vehicleId, recordedTrips] of Object.entries(vehicleTripsMap)) {
       const ws = workbook.addWorksheet(vehicleId);
       
@@ -790,6 +860,33 @@ app.get('/api/admin/export-excel/:monthYear', verifyAdminAuth, async (req, res) 
       ws.columns = [{width: 15}, {width: 15}, {width: 15}, {width: 15}, {width: 15}, {width: 15}, {width: 15}, {width: 15}];
     }
 
+    // --- FUEL STATEMENT SHEET ---
+    const fuelWs = workbook.addWorksheet('Fuel Statement');
+    fuelWs.addRow(['Vehicle No', 'Month', 'Date', 'Received Amount', 'Petrol', 'GNG Filling 1', 'GNG Filling 2', 'GNG Filling 3', 'Total Amount', 'Starting Kms', 'Closing Kms', 'Total Kms']);
+
+    for (const [vehicleId, datesObj] of Object.entries(vehicleFuelMap)) {
+      for (const [dateVal, fData] of Object.entries(datesObj)) {
+        const startKms = parseFloat(fData.startingOdo) || 0;
+        const closeKms = parseFloat(fData.closingOdo) || 0;
+        const totalKmsCalc = (closeKms > startKms) ? (closeKms - startKms).toFixed(1) : 0;
+
+        fuelWs.addRow([
+          vehicleId,
+          sheetName,
+          dateVal,
+          fData.totalCost,
+          fData.petrol > 0 ? fData.petrol : '',
+          fData.cngFills[0] || '',
+          fData.cngFills[1] || '',
+          fData.cngFills[2] || '',
+          fData.totalCost,
+          fData.startingOdo,
+          fData.closingOdo,
+          totalKmsCalc
+        ]);
+      }
+    }
+
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename=Professional_Billing_Report_${sheetName.replace(' ', '_')}.xlsx`);
     await workbook.xlsx.write(res);
@@ -820,9 +917,21 @@ app.post('/api/trips/sync', async (req, res) => {
 // --- FUEL / GAS FILLING LOGGING ENDPOINT ---
 app.post('/api/fuel/sync', async (req, res) => {
   try {
-    const { vehicle_id, driver_name, fuel_type, liters, total_cost, odometer, timestamp } = req.body;
+    const { 
+      vehicle_id, 
+      driver_name, 
+      fuel_type, 
+      shift_time, 
+      quantity, 
+      unit, 
+      total_cost, 
+      per_unit_rate, 
+      odometer, 
+      timestamp, 
+      station_location 
+    } = req.body;
     
-    if (!vehicle_id || !liters || !total_cost) {
+    if (!vehicle_id || !quantity || !total_cost) {
       return res.status(400).json({ status: 'error', message: 'Missing required fuel fields.' });
     }
 
@@ -835,15 +944,19 @@ app.post('/api/fuel/sync', async (req, res) => {
       timestamp || new Date().toLocaleString(),
       vehicle_id.trim().toUpperCase(),
       (driver_name || '').trim().toUpperCase(),
-      fuel_type || 'CNG', // CNG, Petrol, or Diesel
-      liters,
+      fuel_type || 'CNG',
+      shift_time || 'Mid-Day',
+      quantity,
+      unit || 'KG',
       total_cost,
-      odometer || ''
+      per_unit_rate || '',
+      odometer || '',
+      station_location || ''
     ];
 
     await googleSheets.spreadsheets.values.append({
       spreadsheetId,
-      range: 'FuelLogs!A:G',
+      range: 'FuelLogs!A:K',
       valueInputOption: 'USER_ENTERED',
       resource: { values: [rowData] },
     });
@@ -855,9 +968,30 @@ app.post('/api/fuel/sync', async (req, res) => {
   }
 });
 
+// --- ROUTE BREADCRUMBS ENDPOINTS ---
+app.post('/api/trips/breadcrumb', async (req, res) => {
+  try {
+    const breadcrumb = req.body;
+    console.log(`Received trip breadcrumb for Vehicle: ${breadcrumb.vehicle_id}`);
+    res.status(200).json({ status: 'success' });
+  } catch (error) {
+    res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
+app.post('/api/fleet/breadcrumb', async (req, res) => {
+  try {
+    const breadcrumb = req.body;
+    console.log(`Received shift breadcrumb for Vehicle: ${breadcrumb.vehicle_id}`);
+    res.status(200).json({ status: 'success' });
+  } catch (error) {
+    res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
 app.post('/api/fleet/location', (req, res) => {
   const { vehicle_id, latitude, longitude, speed } = req.body;
-  if (vehicle_id) liveFleetTracker[vehicle_id.trim().toUpperCase()] = { latitude, longitude, speed };
+  if (vehicle_id) liveFleetTracker[vehicle_id.trim().toUpperCase()] = { latitude, longitude, speed, last_updated: new Date().toLocaleString() };
   res.status(200).json({ status: 'success' });
 });
 
