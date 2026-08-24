@@ -5,7 +5,6 @@ const { google } = require('googleapis');
 const ExcelJS = require('exceljs');
 const bcrypt = require('bcrypt');
 const multer = require('multer');
-const { GoogleGenAI } = require('@google/genai');
 require('dotenv').config();
 
 const app = express();
@@ -16,9 +15,6 @@ app.use(cors());
 const PORT = process.env.PORT || 3000;
 const liveFleetTracker = {};
 const upload = multer({ storage: multer.memoryStorage() });
-
-// Initialize Gemini using your environment variable on Render
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 // --- DATE NORMALIZER HELPER FOR EXCEL EXPORT ---
 function normalizeDateKey(dateStr) {
@@ -972,59 +968,6 @@ app.post('/api/trips/sync', async (req, res) => {
     res.status(200).json({ status: 'success' });
   } catch (error) {
     res.status(500).json({ error: 'Internal Server Error' });
-  }
-});
-
-// --- SECURE VISION AI DISPENSER ROUTE WITH STRUCTURED JSON ---
-app.post('/api/analyze-dispenser', upload.single('image'), async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No image uploaded' });
-    }
-
-    const imagePart = {
-      inlineData: {
-        data: req.file.buffer.toString('base64'),
-        mimeType: req.file.mimetype || 'image/jpeg',
-      },
-    };
-
-    const prompt = `
-    Analyze this gas or fuel dispenser image carefully. The digital values are displayed on separate screens across the panel:
-    1. "total": Look for the screen labeled "TOTAL (₹)" (showing total money like 575.21).
-    2. "qty": Look for the screen labeled "QTY (kg)" or similar quantity display (showing mass like 5.93).
-    3. "rate": Look for the screen labeled "RATE (₹/kg)" or unit price (showing the unit rate like 97.00).
-
-    Cross-check your math: 'qty' multiplied by 'rate' should roughly equal 'total'.
-    
-    Return ONLY a valid raw JSON object using these exact keys: "qty", "rate", "total". Do not include any markdown formatting like \`\`\`json.
-    `;
-
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.7-flash',
-      contents: [prompt, imagePart],
-    });
-
-    let jsonString = response.text?.trim() || '{}';
-    jsonString = jsonString.replace(/```json/g, '').replace(/```/g, '').trim();
-
-    const start = jsonString.indexOf('{');
-    const end = jsonString.lastIndexOf('}');
-    if (start !== -1 && end !== -1) {
-      jsonString = jsonString.substring(start, end + 1);
-    }
-
-    const parsedData = JSON.parse(jsonString);
-
-    return res.status(200).json({
-      qty: parsedData.qty?.toString() || '0.00',
-      rate: parsedData.rate?.toString() || '0.00',
-      total: parsedData.total?.toString() || '0.00',
-    });
-
-  } catch (error) {
-    console.error('Server AI Error:', error);
-    return res.status(500).json({ error: 'Failed to process dispenser image' });
   }
 });
 
